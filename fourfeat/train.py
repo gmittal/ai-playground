@@ -34,12 +34,16 @@ config_flags.DEFINE_config_file(
 
 
 class MLP(nn.Module):
+    fourier: bool
+
     @nn.compact
     def __call__(self, x, B):
-        variance = self.param('b_var', nn.initializers.ones, (1,))
-        B = variance * B
-        x_proj = 2.0 * jnp.pi * x @ B.T
-        x = jnp.concatenate([jnp.sin(x_proj), jnp.cos(x_proj)], axis=-1)
+
+        if self.fourier:
+            variance = self.param('b_var', nn.initializers.ones, (1,))
+            B = variance * B
+            x_proj = 2.0 * jnp.pi * x @ B.T
+            x = jnp.concatenate([jnp.sin(x_proj), jnp.cos(x_proj)], axis=-1)
 
         x = nn.Dense(256)(x)
         x = nn.relu(x)
@@ -91,7 +95,7 @@ def numpy_collate(batch):
 
 
 def create_train_state(rng, config):
-    model = MLP()
+    model = MLP(config.fourier_feat)
     params = model.init(rng, jnp.ones([1, 2]), jnp.ones((config.kernel_dim, 2)))[
         'params'
     ]
@@ -134,7 +138,7 @@ def generate_image(state, B, height, width):
     xx = 2.0 * (xx / width) - 1.0
     coords = jnp.stack((yy, xx), axis=2).reshape(-1, 2)
 
-    z_flat = MLP().apply({"params": state.params}, coords, B)
+    z_flat = state.apply_fn({"params": state.params}, coords, B)
     recon = z_flat.reshape(height, width, 3)
     recon = (recon * 255).astype(np.uint8)
     return recon
@@ -145,6 +149,7 @@ def main(argv):
 
     rng = jax.random.PRNGKey(0)
     config = FLAGS.config
+    fourfeat = config.fourier_feat
     np.random.seed(config.np_seed)
 
     # setup data
@@ -163,6 +168,7 @@ def main(argv):
     examples_seen = 0
 
     # create Gaussian kernel
+    # TODO: should checkpoint this as well
     b_kernel = jnp.sqrt(config.initial_variance) * jnp.array(
         np.random.randn(config.kernel_dim, 2)
     )
@@ -176,7 +182,7 @@ def main(argv):
     # print model
     rng, tabulate_rng = jax.random.split(rng)
     x = train_dataset[0]['x']
-    tabulate_fn = nn.tabulate(MLP(), tabulate_rng)
+    tabulate_fn = nn.tabulate(MLP(fourfeat), tabulate_rng)
     logging.info(tabulate_fn(x, b_kernel))
 
     # train

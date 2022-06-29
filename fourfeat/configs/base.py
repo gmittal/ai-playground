@@ -15,6 +15,7 @@ def get_config():
     config.train_steps = 500
 
     # random kernel
+    config.fourier_feat = True
     config.kernel_dim = 256
     config.initial_variance = 20.0
 
