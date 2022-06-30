@@ -37,7 +37,6 @@ class CoordConv2D(nn.Module):
     features: int
     kernel_size: tuple
     strides: tuple
-    with_r: bool
 
     @nn.compact
     def __call__(self, x):
@@ -70,13 +69,6 @@ class CoordConv2D(nn.Module):
         yy_channel = yy_channel.repeat(batch_size, axis=0)
 
         x_with_coords = jnp.concatenate((x, xx_channel, yy_channel), axis=-1)
-
-        if self.with_r:
-            r_channel = jnp.sqrt(
-                jnp.power(xx_channel - 0.5, 2) + jnp.power(yy_channel - 0.5, 2)
-            )
-            x_with_coords = jnp.concatenate((x_with_coords, r_channel), axis=-1)
-
         x = nn.Conv(self.features, self.kernel_size, self.strides)(x_with_coords)
         return x
 
@@ -110,10 +102,8 @@ class Net(nn.Module):
         # return x[:, :, :, 0]
 
         # coordconv, works!
-        c = 1
-        fs = 1
         x = jnp.tile(x[:, None, None, :], (1, 64, 64, 1))
-        x = CoordConv2D(32, (1, 1), (1, 1), with_r=True)(x)
+        x = CoordConv2D(32, (1, 1), (1, 1))(x)
         x = nn.Conv(64, (1, 1), (1, 1))(x)
         x = nn.relu(x)
         x = nn.Conv(64, (1, 1), (1, 1))(x)
@@ -121,14 +111,14 @@ class Net(nn.Module):
         x = nn.Conv(1, (1, 1), (1, 1))(x)
         x = nn.relu(x)
         x = nn.Conv(1, (1, 1), (1, 1))(x)
-        x = nn.relu(x)
-        x = nn.Conv(8 * c, (fs, fs), (1, 1))(x)
-        x = nn.relu(x)
-        x = nn.Conv(16 * c, (fs, fs), (1, 1))(x)
-        x = nn.relu(x)
-        x = nn.Conv(16 * c, (fs, fs), (1, 1))(x)
-        x = nn.relu(x)
-        x = nn.Conv(1, (fs, fs), (1, 1))(x)
+        # x = nn.relu(x)
+        # x = nn.Conv(8 * c, (fs, fs), (1, 1))(x)
+        # x = nn.relu(x)
+        # x = nn.Conv(16 * c, (fs, fs), (1, 1))(x)
+        # x = nn.relu(x)
+        # x = nn.Conv(16 * c, (fs, fs), (1, 1))(x)
+        # x = nn.relu(x)
+        # x = nn.Conv(1, (fs, fs), (1, 1))(x)
         return x[:, :, :, 0]
 
 
