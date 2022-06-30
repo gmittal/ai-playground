@@ -2,14 +2,13 @@ import functools
 import itertools
 import pathlib
 
-import colorama
 import chex
+import colorama
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
 import numpy as np
 import optax
-import scipy.signal
 
 from absl import app
 from absl import flags
