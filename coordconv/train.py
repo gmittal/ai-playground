@@ -141,7 +141,8 @@ class NotSoCleverDataset(Dataset):
     def __getitem__(self, idx):
         one_idx = np.where(self.onehots[idx])
         x, y = one_idx[0][0], one_idx[1][0]
-        return {'x': np.array([x, y]) / 64.0, 'y': self.images[idx]}
+        image = np.float32(self.iamges[idx] > 0.5)
+        return {'x': np.array([x, y]) / 64.0, 'y': image}
 
 
 def numpy_collate(batch):
