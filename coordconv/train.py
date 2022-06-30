@@ -104,9 +104,9 @@ def train_step(state, batch):
         return loss, pred_out
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, _), grads = grad_fn(state.params)
+    (loss, logits), grads = grad_fn(state.params)
     state = state.apply_gradients(grads=grads)
-    return state, loss
+    return state, (loss, logits)
 
 
 @functools.partial(
@@ -118,7 +118,7 @@ def train_step(state, batch):
 )
 def generate_image(state, x, y):
     recon = state.apply_fn({"params": state.params}, jnp.array([x, y])[None, :] / 64.0)
-    recon = nn.sigmoid(recon)
+    recon = nn.sigmoid(recon) > 0.5
     return jnp.uint8(recon * 255)[0]
 
 
@@ -158,14 +158,24 @@ def main(argv):
     # train
     while state.step < config.train_steps:
         batch = next(data_iter)
-        state, loss = train_step(state, batch)
+        state, (loss, logits) = train_step(state, batch)
+
+        # compute additional metrics
+        train_pred = jnp.bool_(nn.sigmoid(logits) > 0.5)
+        train_real = jnp.bool_(batch['y'])
+        chex.assert_equal_shape([train_pred, train_real])
+        accuracy = jnp.mean(train_pred == train_real)
+        intersection = (train_pred & train_real).sum(axis=(1, 2))
+        union = (train_pred | train_real).sum(axis=(1, 2))
+        jaccard = jnp.mean(intersection / union)
 
         examples_seen += len(batch[list(batch.keys())[0]])
         epoch_frac = examples_seen / len(train_dataset)
 
         if state.step % config.logging_interval == 0:
             logging.info(
-                f'step {state.step} | epoch {epoch_frac:.2f} | loss {loss.item():.4f}'
+                f'step {state.step} | epoch {epoch_frac:.2f} | loss {loss.item():.4f} '
+                f'| accuracy {accuracy.item():.4f} | iou {jaccard.item():.4f}'
             )
 
         if state.step % config.eval_interval == 0:
