@@ -34,17 +34,103 @@ config_flags.DEFINE_config_file(
 )
 
 
-class MLP(nn.Module):
+class CoordConv2D(nn.Module):
+    features: int
+    kernel_size: tuple
+    strides: tuple
+    with_r: bool
+
+    @nn.compact
+    def __call__(self, x):
+        batch_size, dim_y, dim_x, _ = x.shape
+        xx_ones = jnp.ones((1, 1, 1, dim_x), dtype=jnp.int32)
+        yy_ones = jnp.ones((1, 1, 1, dim_y), dtype=jnp.int32)
+
+        xx_range = jnp.arange(dim_y, dtype=jnp.int32)
+        yy_range = jnp.arange(dim_x, dtype=jnp.int32)
+        xx_range = xx_range[None, None, :, None]
+        yy_range = yy_range[None, None, :, None]
+
+        xx_channel = xx_range @ xx_ones
+        yy_channel = yy_range @ yy_ones
+
+        # transpose y
+        yy_channel = jnp.transpose(yy_channel, (0, 1, 3, 2))
+
+        xx_channel = xx_channel.astype(jnp.float32) / (dim_y - 1)
+        yy_channel = yy_channel.astype(jnp.float32) / (dim_x - 1)
+
+        xx_channel = xx_channel * 2 - 1
+        yy_channel = yy_channel * 2 - 1
+
+        # convert to (b, h, w, c)
+        xx_channel = jnp.transpose(xx_channel, (0, 2, 3, 1))
+        yy_channel = jnp.transpose(yy_channel, (0, 2, 3, 1))
+
+        xx_channel = xx_channel.repeat(batch_size, axis=0)
+        yy_channel = yy_channel.repeat(batch_size, axis=0)
+
+        x_with_coords = jnp.concatenate((x, xx_channel, yy_channel), axis=-1)
+
+        if self.with_r:
+            r_channel = jnp.sqrt(
+                jnp.power(xx_channel - 0.5, 2) + jnp.power(yy_channel - 0.5, 2)
+            )
+            x_with_coords = jnp.concatenate((x_with_coords, r_channel), axis=-1)
+
+        x = nn.Conv(self.features, self.kernel_size, self.strides)(x_with_coords)
+        return x
+
+
+class Net(nn.Module):
     @nn.compact
     def __call__(self, x):
 
-        # dump mlp, probably will need fourier feats again
+        # dump mlp, probably will need fourier feats to improve
         # for the high frequency jump for the square
-        x = nn.Dense(512)(x)
+        # x = nn.Dense(512)(x)
+        # x = nn.relu(x)
+        # x = nn.Dense(64 * 64)(x)
+        # x = x.reshape(x.shape[0], 64, 64)
+        # return x
+
+        # dumb deconv
+        # c = 1
+        # fs = 2
+        # x = nn.ConvTranspose(64 * c, (fs, fs), (1, 2))(x[:, :, None, None])
+        # x = nn.relu(x)
+        # x = nn.ConvTranspose(64 * c, (fs, fs), (2, 2))(x)
+        # x = nn.relu(x)
+        # x = nn.ConvTranspose(64 * c, (fs, fs), (2, 2))(x)
+        # x = nn.relu(x)
+        # x = nn.ConvTranspose(32 * c, (fs, fs), (2, 2))(x)
+        # x = nn.relu(x)
+        # x = nn.ConvTranspose(32 * c, (fs, fs), (2, 2))(x)
+        # x = nn.relu(x)
+        # x = nn.ConvTranspose(1 * c, (fs, fs), (2, 2))(x)
+        # return x[:, :, :, 0]
+
+        # coordconv, works!
+        c = 1
+        fs = 1
+        x = jnp.tile(x[:, None, None, :], (1, 64, 64, 1))
+        x = CoordConv2D(32, (1, 1), (1, 1), with_r=True)(x)
+        x = nn.Conv(64, (1, 1), (1, 1))(x)
         x = nn.relu(x)
-        x = nn.Dense(64 * 64)(x)
-        x = x.reshape(x.shape[0], 64, 64)
-        return x
+        x = nn.Conv(64, (1, 1), (1, 1))(x)
+        x = nn.relu(x)
+        x = nn.Conv(1, (1, 1), (1, 1))(x)
+        x = nn.relu(x)
+        x = nn.Conv(1, (1, 1), (1, 1))(x)
+        x = nn.relu(x)
+        x = nn.Conv(8 * c, (fs, fs), (1, 1))(x)
+        x = nn.relu(x)
+        x = nn.Conv(16 * c, (fs, fs), (1, 1))(x)
+        x = nn.relu(x)
+        x = nn.Conv(16 * c, (fs, fs), (1, 1))(x)
+        x = nn.relu(x)
+        x = nn.Conv(1, (fs, fs), (1, 1))(x)
+        return x[:, :, :, 0]
 
 
 class NotSoCleverDataset(Dataset):
@@ -82,7 +168,7 @@ def numpy_collate(batch):
 
 
 def create_train_state(rng, config):
-    model = MLP()
+    model = Net()
     params = model.init(rng, jnp.ones([1, 2]))['params']
 
     # TODO: make optimizer configurable
@@ -152,7 +238,7 @@ def main(argv):
     # print model
     rng, tabulate_rng = jax.random.split(rng)
     x = train_dataset[0]['x'][None, :]
-    tabulate_fn = nn.tabulate(MLP(), tabulate_rng)
+    tabulate_fn = nn.tabulate(Net(), tabulate_rng)
     logging.info(tabulate_fn(x))
 
     # train
