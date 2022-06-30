@@ -1,4 +1,3 @@
-import functools
 import itertools
 import pathlib
 
@@ -9,6 +8,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 import numpy as np
 import optax
+import torchvision.datasets
 
 from absl import app
 from absl import flags
@@ -16,8 +16,7 @@ from absl import logging
 from flax.training import train_state
 from flax.training import checkpoints
 from ml_collections import config_flags
-from PIL import Image
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 
 Fore = colorama.Fore
 Style = colorama.Style
@@ -34,52 +33,22 @@ config_flags.DEFINE_config_file(
 
 
 class MLP(nn.Module):
-    fourier: bool
-
     @nn.compact
-    def __call__(self, x, B):
-
-        if self.fourier:
-            variance = self.param('b_var', nn.initializers.ones, (1,))
-            B = variance * B
-            x_proj = 2.0 * jnp.pi * x @ B.T
-            x = jnp.concatenate([jnp.sin(x_proj), jnp.cos(x_proj)], axis=-1)
-
-        x = nn.Dense(256)(x)
+    def __call__(self, x):
+        x = nn.Conv(features=64, kernel_size=(3, 3))(x)
         x = nn.relu(x)
-        x = nn.Dense(256)(x)
+        x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
+        x = nn.Conv(features=128, kernel_size=(3, 3))(x)
         x = nn.relu(x)
-        x = nn.Dense(256)(x)
+        x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
+        x = nn.Conv(features=256, kernel_size=(3, 3))(x)
         x = nn.relu(x)
-        x = nn.Dense(3)(x)
-        x = nn.sigmoid(x)
+        x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
+        x = x.reshape((x.shape[0], -1))  # flatten
+        x = nn.Dense(features=256)(x)
+        x = nn.relu(x)
+        x = nn.Dense(features=10)(x)
         return x
-
-
-class PixelDataset(Dataset):
-    def __init__(self, img):
-        # img.shape = (H, W, C)
-        self.img = img
-        self.H, self.W, _ = img.shape
-        self.size = self.H * self.W
-
-    def __len__(self):
-        return self.size
-
-    def _index_to_coord(self, idx):
-        return idx // self.W, idx % self.W
-
-    def get_features(self, idx):
-        y, x = self._index_to_coord(idx)
-        y = 2.0 * (y / self.H) - 1.0
-        x = 2.0 * (x / self.W) - 1.0
-        return np.array([y, x])
-
-    def get_label(self, idx):
-        return self.img[self._index_to_coord(idx)] / 255.0
-
-    def __getitem__(self, idx):
-        return {'x': self.get_features(idx), 'y': self.get_label(idx)}
 
 
 def numpy_collate(batch):
@@ -95,10 +64,8 @@ def numpy_collate(batch):
 
 
 def create_train_state(rng, config):
-    model = MLP(config.fourier_feat)
-    params = model.init(rng, jnp.ones([1, 2]), jnp.ones((config.kernel_dim, 2)))[
-        'params'
-    ]
+    model = MLP()
+    params = model.init(rng, jnp.ones([1, 28, 28, 1]))['params']
 
     # TODO: make optimizer configurable
     tx = optax.adam(config.learning_rate, config.beta1, config.beta2)
@@ -106,15 +73,16 @@ def create_train_state(rng, config):
 
 
 @jax.jit
-def train_step(state, batch, B):
-    coords = batch['x']
-    rgb = batch['y']
+def train_step(state, batch):
+    images = batch['x']
+    labels = batch['y']
 
     def loss_fn(params):
-        pred_rgb = state.apply_fn({'params': params}, coords, B)
-        chex.assert_equal_shape([pred_rgb, rgb])
-        loss = jnp.mean(jnp.sum(jnp.square(pred_rgb - rgb), axis=-1))
-        return loss, pred_rgb
+        logits = state.apply_fn({'params': params}, images)
+        one_hot = nn.one_hot(labels, num_classes=10)
+        chex.assert_equal_shape([logits, one_hot])
+        loss = jnp.mean(optax.softmax_cross_entropy(logits=logits, labels=one_hot))
+        return loss, logits
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (loss, _), grads = grad_fn(state.params)
@@ -122,26 +90,21 @@ def train_step(state, batch, B):
     return state, loss
 
 
-@functools.partial(
-    jax.jit,
-    static_argnums=(
-        2,
-        3,
-    ),
-)
-def generate_image(state, B, height, width):
-    x = jnp.arange(width)
-    y = jnp.arange(height)
-    xx, yy = jnp.meshgrid(x, y, sparse=False)
+def compute_metrics(state, dataset):
+    im_labels = [(im, label) for im, label in dataset]
+    images, labels = zip(*im_labels)
+    images = jnp.array([np.array(im)[:, :, None] / 255.0 for im in images])
+    labels = jnp.array(labels)
 
-    yy = 2.0 * (yy / height) - 1.0
-    xx = 2.0 * (xx / width) - 1.0
-    coords = jnp.stack((yy, xx), axis=2).reshape(-1, 2)
+    one_hot = nn.one_hot(labels, num_classes=10)
+    logits = state.apply_fn({'params': state.params}, images)
 
-    z_flat = state.apply_fn({"params": state.params}, coords, B)
-    recon = z_flat.reshape(height, width, 3)
-    recon = (recon * 255).astype(np.uint8)
-    return recon
+    loss = jnp.mean(optax.softmax_cross_entropy(logits=logits, labels=one_hot))
+    acc = jnp.mean(jnp.argmax(logits, axis=-1) == labels)
+    return {
+        'loss': loss,
+        'accuracy': acc,
+    }
 
 
 def main(argv):
@@ -149,29 +112,22 @@ def main(argv):
 
     rng = jax.random.PRNGKey(0)
     config = FLAGS.config
-    fourfeat = config.fourier_feat
     np.random.seed(config.np_seed)
 
     # setup data
-    img = np.array(Image.open(config.image_path))
-    train_dataset = PixelDataset(img)
+    train_dataset = torchvision.datasets.MNIST('/tmp/mnist', train=True, download=True)
+    test_dataset = torchvision.datasets.MNIST('/tmp/mnist', train=False, download=True)
     dataloader = DataLoader(
         train_dataset,
         collate_fn=numpy_collate,
         drop_last=False,
         shuffle=True,
         pin_memory=True,
-        batch_size=len(train_dataset),
+        batch_size=config.batch_size,
         num_workers=config.num_workers,
     )
     data_iter = itertools.cycle(dataloader)
     examples_seen = 0
-
-    # create Gaussian kernel
-    # TODO: should checkpoint this as well
-    b_kernel = jnp.sqrt(config.initial_variance) * jnp.array(
-        np.random.randn(config.kernel_dim, 2)
-    )
 
     # setup model and state
     ckpt_dir = pathlib.Path(FLAGS.workdir) / 'checkpoints'
@@ -181,14 +137,16 @@ def main(argv):
 
     # print model
     rng, tabulate_rng = jax.random.split(rng)
-    x = train_dataset[0]['x']
-    tabulate_fn = nn.tabulate(MLP(fourfeat), tabulate_rng)
-    logging.info(tabulate_fn(x, b_kernel))
+    x = np.array(train_dataset[0][0])[:, :, None]
+    tabulate_fn = nn.tabulate(MLP(), tabulate_rng)
+    logging.info(tabulate_fn(x))
 
     # train
     while state.step < config.train_steps:
-        batch = next(data_iter)
-        state, loss = train_step(state, batch, b_kernel)
+        images, labels = next(data_iter)
+        images = [np.array(im)[:, :, None] / 255.0 for im in images]
+        batch = {'x': jnp.array(images), 'y': jnp.array(labels)}
+        state, loss = train_step(state, batch)
 
         examples_seen += len(batch[list(batch.keys())[0]])
         epoch_frac = examples_seen / len(train_dataset)
@@ -199,14 +157,12 @@ def main(argv):
             )
 
         if state.step % config.eval_interval == 0:
-            recon = generate_image(state, b_kernel, train_dataset.H, train_dataset.W)
-            img_dir = pathlib.Path(FLAGS.workdir) / 'images'
-            img_dir.mkdir(parents=True, exist_ok=True)
-            output_path = str(img_dir / f'{state.step}.png')
-            Image.fromarray(np.array(recon)).save(output_path)
+            metrics = compute_metrics(state, test_dataset)
+            test_loss = metrics['loss']
+            test_acc = metrics['accuracy']
             logging.info(
-                f'{Fore.GREEN}EVAL:{Style.RESET_ALL} saving reconstruction'
-                f' to {output_path}'
+                f'{Fore.GREEN}EVAL:{Style.RESET_ALL} loss {test_loss:.4f} '
+                f'| accuracy {test_acc:.4f}'
             )
 
         if state.step % config.ckpt_interval == 0:
