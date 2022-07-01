@@ -74,52 +74,52 @@ class CoordConv2D(nn.Module):
 
 
 class Net(nn.Module):
+    mode: str
+
     @nn.compact
     def __call__(self, x):
 
-        # dump mlp, probably will need fourier feats to improve
-        # for the high frequency jump for the square
-        # x = nn.Dense(512)(x)
-        # x = nn.relu(x)
-        # x = nn.Dense(64 * 64)(x)
-        # x = x.reshape(x.shape[0], 64, 64)
-        # return x
+        if self.mode == 'mlp':
+            # dump mlp, probably will need fourier feats to improve
+            # for the high frequency jump for the square
+            x = nn.Dense(512)(x)
+            x = nn.relu(x)
+            x = nn.Dense(64 * 64)(x)
+            x = x.reshape(x.shape[0], 64, 64)
+            return x
 
-        # dumb deconv
-        # c = 1
-        # fs = 2
-        # x = nn.ConvTranspose(64 * c, (fs, fs), (1, 2))(x[:, :, None, None])
-        # x = nn.relu(x)
-        # x = nn.ConvTranspose(64 * c, (fs, fs), (2, 2))(x)
-        # x = nn.relu(x)
-        # x = nn.ConvTranspose(64 * c, (fs, fs), (2, 2))(x)
-        # x = nn.relu(x)
-        # x = nn.ConvTranspose(32 * c, (fs, fs), (2, 2))(x)
-        # x = nn.relu(x)
-        # x = nn.ConvTranspose(32 * c, (fs, fs), (2, 2))(x)
-        # x = nn.relu(x)
-        # x = nn.ConvTranspose(1 * c, (fs, fs), (2, 2))(x)
-        # return x[:, :, :, 0]
+        elif self.mode == 'deconv':
+            # deconv, doesn't really work
+            c = 1
+            fs = 2
+            x = nn.ConvTranspose(64 * c, (fs, fs), (1, 2))(x[:, :, None, None])
+            x = nn.relu(x)
+            x = nn.ConvTranspose(64 * c, (fs, fs), (2, 2))(x)
+            x = nn.relu(x)
+            x = nn.ConvTranspose(64 * c, (fs, fs), (2, 2))(x)
+            x = nn.relu(x)
+            x = nn.ConvTranspose(32 * c, (fs, fs), (2, 2))(x)
+            x = nn.relu(x)
+            x = nn.ConvTranspose(32 * c, (fs, fs), (2, 2))(x)
+            x = nn.relu(x)
+            x = nn.ConvTranspose(1 * c, (fs, fs), (2, 2))(x)
+            return x[:, :, :, 0]
 
-        # coordconv, works!
-        x = jnp.tile(x[:, None, None, :], (1, 64, 64, 1))
-        x = CoordConv2D(32, (1, 1), (1, 1))(x)
-        x = nn.Conv(64, (1, 1), (1, 1))(x)
-        x = nn.relu(x)
-        x = nn.Conv(64, (1, 1), (1, 1))(x)
-        x = nn.relu(x)
-        x = nn.Conv(1, (1, 1), (1, 1))(x)
-        x = nn.relu(x)
-        x = nn.Conv(1, (1, 1), (1, 1))(x)
-        # x = nn.relu(x)
-        # x = nn.Conv(8 * c, (fs, fs), (1, 1))(x)
-        # x = nn.relu(x)
-        # x = nn.Conv(16 * c, (fs, fs), (1, 1))(x)
-        # x = nn.relu(x)
-        # x = nn.Conv(16 * c, (fs, fs), (1, 1))(x)
-        # x = nn.relu(x)
-        # x = nn.Conv(1, (fs, fs), (1, 1))(x)
-        return x[:, :, :, 0]
+        elif self.mode == 'coordconv':
+            # coordconv, works!
+            x = jnp.tile(x[:, None, None, :], (1, 64, 64, 1))
+            x = CoordConv2D(32, (1, 1), (1, 1))(x)
+            x = nn.Conv(64, (1, 1), (1, 1))(x)
+            x = nn.relu(x)
+            x = nn.Conv(64, (1, 1), (1, 1))(x)
+            x = nn.relu(x)
+            x = nn.Conv(1, (1, 1), (1, 1))(x)
+            x = nn.relu(x)
+            x = nn.Conv(1, (1, 1), (1, 1))(x)
+            return x[:, :, :, 0]
+
+        else:
+            raise ValueError(f'Unknown config: {self.mode}')
 
 
 class NotSoCleverDataset(Dataset):
@@ -141,7 +141,7 @@ class NotSoCleverDataset(Dataset):
     def __getitem__(self, idx):
         one_idx = np.where(self.onehots[idx])
         x, y = one_idx[0][0], one_idx[1][0]
-        image = np.float32(self.iamges[idx] > 0.5)
+        image = np.float32(self.images[idx] > 0.5)
         return {'x': np.array([x, y]) / 64.0, 'y': image}
 
 
@@ -158,7 +158,7 @@ def numpy_collate(batch):
 
 
 def create_train_state(rng, config):
-    model = Net()
+    model = Net(mode=config.arch)
     params = model.init(rng, jnp.ones([1, 2]))['params']
 
     # TODO: make optimizer configurable
@@ -228,7 +228,7 @@ def main(argv):
     # print model
     rng, tabulate_rng = jax.random.split(rng)
     x = train_dataset[0]['x'][None, :]
-    tabulate_fn = nn.tabulate(Net(), tabulate_rng)
+    tabulate_fn = nn.tabulate(Net(mode=config.arch), tabulate_rng)
     logging.info(tabulate_fn(x))
 
     # train

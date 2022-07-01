@@ -12,15 +12,12 @@ def get_config():
     config.beta1 = 0.9
     config.beta2 = 0.999
     config.batch_size = 128
-    config.train_steps = 500
+    config.train_steps = 1000
 
-    # random kernel
-    config.fourier_feat = True
-    config.kernel_dim = 256
-    config.initial_variance = 20.0
+    # model
+    config.arch = 'coordconv'
 
     # dataloader
-    config.image_path = 'hendrix.jpg'
     config.num_workers = 0
 
     config.logging_interval = 10
