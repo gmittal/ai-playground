@@ -3,7 +3,6 @@ import os
 import pathlib
 import tempfile
 
-import chex
 import colorama
 import flax.linen as nn
 import jax
@@ -18,7 +17,6 @@ from flax.core.frozen_dict import freeze, unfreeze
 from flax.training import train_state
 from ml_collections import config_flags
 from PIL import Image
-from torch.utils.data import Dataset
 
 
 Fore = colorama.Fore
