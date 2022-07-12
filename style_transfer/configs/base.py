@@ -14,6 +14,7 @@ def get_config():
     config.train_steps = 100
 
     # images
+    config.image_size = 400  # square images for now
     config.content = 'abbey_road.jpg'
     config.style = 'starry.jpeg'
 

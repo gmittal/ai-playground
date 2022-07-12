@@ -225,8 +225,9 @@ def main(argv):
         workdir = tempfile.mkdtemp(prefix='neural_style-')
 
     # load the images
-    content_img = load_image(os.path.expanduser(config.content), 256, 256)
-    style_img = load_image(os.path.expanduser(config.style), 256, 256)
+    h, w = config.image_size, config.image_size
+    content_img = load_image(os.path.expanduser(config.content), h, w)
+    style_img = load_image(os.path.expanduser(config.style), h, w)
 
     # setup model and state
     state, nn_params = create_state(content_img, config)
