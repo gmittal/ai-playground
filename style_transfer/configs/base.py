@@ -5,26 +5,19 @@ def get_config():
     config = ml_collections.ConfigDict()
 
     # random seeds
-    config.np_seed = 42
+    config.seed = 42
 
     # optimizer
-    config.learning_rate = 3e-4 * 4
+    config.learning_rate = 1e-2
     config.beta1 = 0.9
     config.beta2 = 0.999
-    config.batch_size = 64
-    config.train_steps = 10_000
+    config.train_steps = 100
 
-    # model
-    config.block_size = 128
+    # images
+    config.content = 'abbey_road.jpg'
+    config.style = 'starry.jpeg'
 
-    # dataset
-    config.input_file = 'shakespeare.txt'
-
-    # dataloader
-    config.num_workers = 0
-
-    config.logging_interval = 10
-    config.eval_interval = 100
-    config.ckpt_interval = 100
+    config.logging_interval = 1
+    config.eval_interval = 10
 
     return config

@@ -1,5 +1,5 @@
 import functools
-import itertools
+import os
 import pathlib
 import tempfile
 
@@ -17,7 +17,8 @@ from absl import logging
 from flax.core.frozen_dict import freeze, unfreeze
 from flax.training import train_state
 from ml_collections import config_flags
-from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+from torch.utils.data import Dataset
 
 
 Fore = colorama.Fore
@@ -34,34 +35,33 @@ config_flags.DEFINE_config_file(
 )
 
 
-def load_vgg16_weights(model, params):
+def load_image(path, height, width):
+    """Load and resize image."""
+    img = Image.open(path)
+    img = img.resize((height, width), Image.BILINEAR)
+    img = np.array(img).astype(np.float32)
+    img = img / 255.0
+    return img
+
+
+def load_vgg16_weights(params):
     """Load torchvision VGG16 weights into JAX params."""
-    import torch
     from torchvision.models import vgg16
 
     torch_model = vgg16(pretrained=True)
     torch_params = torch_model.features.state_dict()
 
     mutable_params = unfreeze(params)
-    for param_name in mutable_params['backbone'].keys():
+    for param_name in mutable_params.keys():
         layer_id = param_name.split('_')[-1]
 
         torch_kernel = torch_params[f'{layer_id}.weight'].permute((2, 3, 1, 0))
         torch_bias = torch_params[f'{layer_id}.bias']
 
-        mutable_params['backbone'][param_name]['kernel'] = jnp.array(torch_kernel)
-        mutable_params['backbone'][param_name]['bias'] = jnp.array(torch_bias)
+        mutable_params[param_name]['kernel'] = jnp.array(torch_kernel)
+        mutable_params[param_name]['bias'] = jnp.array(torch_bias)
     new_params = freeze(mutable_params)
-
-    # Test that the weights are loaded correctly
-    jax_out = np.array(model.apply({'params': new_params}, jnp.ones((1, 32, 32, 3))))
-    torch_out = (
-        torch_model.features(torch.ones((1, 3, 32, 32)))
-        .permute((0, 2, 3, 1))
-        .detach()
-        .numpy()
-    )
-    assert np.allclose(jax_out, torch_out, 1e-3)
+    # TODO: add assert checking that max_pool jax implementation is correct
 
     return new_params
 
@@ -74,194 +74,194 @@ class VGG16(nn.Module):
     """
 
     def setup(self):
-        self.backbone = nn.Sequential(
-            [
-                nn.Conv(64, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
-                nn.relu,
-                nn.Conv(64, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
-                nn.relu,
-                functools.partial(
-                    nn.max_pool,
-                    window_shape=(2, 2),
-                    strides=(2, 2),
-                    padding=((0, 0), (0, 0)),
-                ),
-                nn.Conv(128, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
-                nn.relu,
-                nn.Conv(128, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
-                nn.relu,
-                functools.partial(
-                    nn.max_pool,
-                    window_shape=(2, 2),
-                    strides=(2, 2),
-                    padding=((0, 0), (0, 0)),
-                ),
-                nn.Conv(256, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
-                nn.relu,
-                nn.Conv(256, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
-                nn.relu,
-                nn.Conv(256, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
-                nn.relu,
-                functools.partial(
-                    nn.max_pool,
-                    window_shape=(2, 2),
-                    strides=(2, 2),
-                    padding=((0, 0), (0, 0)),
-                ),
-                nn.Conv(512, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
-                nn.relu,
-                nn.Conv(512, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
-                nn.relu,
-                nn.Conv(512, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
-                nn.relu,
-                functools.partial(
-                    nn.max_pool,
-                    window_shape=(2, 2),
-                    strides=(2, 2),
-                    padding=((0, 0), (0, 0)),
-                ),
-                nn.Conv(512, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
-                nn.relu,
-                nn.Conv(512, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
-                nn.relu,
-                nn.Conv(512, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
-                nn.relu,
-                functools.partial(
-                    nn.max_pool,
-                    window_shape=(2, 2),
-                    strides=(2, 2),
-                    padding=((0, 0), (0, 0)),
-                ),
-            ]
-        )
+        self.backbone = [
+            nn.Conv(64, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
+            nn.relu,
+            nn.Conv(64, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
+            nn.relu,
+            functools.partial(
+                nn.avg_pool,
+                window_shape=(2, 2),
+                strides=(2, 2),
+                padding=((0, 0), (0, 0)),
+            ),
+            nn.Conv(128, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
+            nn.relu,
+            nn.Conv(128, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
+            nn.relu,
+            functools.partial(
+                nn.avg_pool,
+                window_shape=(2, 2),
+                strides=(2, 2),
+                padding=((0, 0), (0, 0)),
+            ),
+            nn.Conv(256, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
+            nn.relu,
+            nn.Conv(256, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
+            nn.relu,
+            nn.Conv(256, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
+            nn.relu,
+            functools.partial(
+                nn.avg_pool,
+                window_shape=(2, 2),
+                strides=(2, 2),
+                padding=((0, 0), (0, 0)),
+            ),
+            nn.Conv(512, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
+            nn.relu,
+            nn.Conv(512, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
+            nn.relu,
+            nn.Conv(512, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
+            nn.relu,
+            functools.partial(
+                nn.avg_pool,
+                window_shape=(2, 2),
+                strides=(2, 2),
+                padding=((0, 0), (0, 0)),
+            ),
+            nn.Conv(512, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
+            nn.relu,
+            nn.Conv(512, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
+            nn.relu,
+            nn.Conv(512, kernel_size=(3, 3), strides=(1, 1), padding=(1, 1)),
+            nn.relu,
+            functools.partial(
+                nn.avg_pool,
+                window_shape=(2, 2),
+                strides=(2, 2),
+                padding=((0, 0), (0, 0)),
+            ),
+        ]
 
-    def __call__(self, x):
-        return self.backbone(x)
+    def __call__(self, x, layer_idx=None):
+        # normalization constants from torch
+        mu = jnp.array([0.485, 0.456, 0.406])
+        std = jnp.array([0.229, 0.224, 0.225])
+        x = (x - mu) / std
 
-
-class CharDataset(Dataset):
-    def __init__(self, data, block_size):
-        chars = sorted(list(set(data)))
-        data_size, vocab_size = len(data), len(chars)
-        print('data has %d characters, %d unique.' % (data_size, vocab_size))
-
-        self.stoi = {ch: i for i, ch in enumerate(chars)}
-        self.itos = {i: ch for i, ch in enumerate(chars)}
-        self.block_size = block_size
-        self.vocab_size = vocab_size
-        self.data = data
-
-    def __len__(self):
-        return len(self.data) - self.block_size
-
-    def __getitem__(self, idx):
-        # grab a chunk of (block_size + 1) characters from the data
-        chunk = self.data[idx : idx + self.block_size + 1]
-
-        # encode every character to an integer
-        dix = [self.stoi[s] for s in chunk]
-        x = np.array(dix[:-1], dtype=np.int64)
-        y = np.array(dix[1:], dtype=np.int64)
-        return {'x': x, 'y': y}
+        layer_activations = []
+        for i, layer in enumerate(self.backbone):
+            x = layer(x)
+            if layer_idx is not None and i in layer_idx:
+                layer_activations.append(x)
+        return x if layer_idx is None else layer_activations
 
 
-def numpy_collate(batch):
-    if isinstance(batch[0], np.ndarray):
-        return np.stack(batch)
-    elif isinstance(batch[0], (tuple, list)):
-        transposed = zip(*batch)
-        return [numpy_collate(samples) for samples in transposed]
-    elif isinstance(batch[0], dict):
-        return {key: numpy_collate([d[key] for d in batch]) for key in batch[0]}
-    else:
-        return np.array(batch)
-
-
-def create_state(rng, config):
+def create_state(init_image, config):
     model = VGG16()
 
     # hold the model parameters fixed
-    params = model.init(rng, jnp.ones((1, 32, 32, 3)))['params']
-    params = load_vgg16_weights(model, params)
+    params = model.init(jax.random.PRNGKey(0), jnp.ones((1, 32, 32, 3)))['params']
+    params = load_vgg16_weights(params)
 
     tx = optax.adam(config.learning_rate, config.beta1, config.beta2)
-    # TODO: make the train state params the image
-    return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+    image = freeze({'image': init_image})
+    state = train_state.TrainState.create(apply_fn=model.apply, params=image, tx=tx)
+    return state, params
+
+
+def gram_matrix(act):
+    b, h, w, c = act.shape
+    act = act.transpose((0, 3, 1, 2))
+    F = act.reshape(b * c, -1)
+    return F @ F.T / (b * h * w * c)
 
 
 @jax.jit
-def train_step(state, batch):
-    tokens = batch['x']
-    next_tokens = batch['y']
-
+def transfer_step(
+    *, state, vgg_params, content_image, style_image, content_weight, style_weight
+):
     def loss_fn(params):
-        logits = state.apply_fn({'params': params}, tokens)
-        chex.assert_equal_shape([logits[:, :, 0], next_tokens])
-        loss = jnp.mean(
-            optax.softmax_cross_entropy_with_integer_labels(
-                logits=logits, labels=next_tokens
-            )
+        input_image = jnp.clip(params['image'][None, :], 0, 1)
+        input_act = state.apply_fn(
+            {'params': vgg_params},
+            input_image,
+            layer_idx=[0 + 1, 5 + 1, 10 + 1, 19 + 1, 28 + 1],
         )
-        return loss, logits
+        content_act = state.apply_fn(
+            {'params': vgg_params},
+            content_image[None, :],
+            layer_idx=[19 + 1],
+        )
+        style_act = state.apply_fn(
+            {'params': vgg_params},
+            style_image[None, :],
+            layer_idx=[0 + 1, 5 + 1, 10 + 1, 19 + 1, 28 + 1],
+        )
+
+        content_loss = sum(
+            [
+                jnp.mean(optax.l2_loss(i_a, c_a))
+                for i_a, c_a in zip([input_act[3]], content_act)
+            ]
+        )
+        style_loss = sum(
+            [
+                jnp.mean(optax.l2_loss(gram_matrix(i_a), gram_matrix(s_a)))
+                for i_a, s_a in zip(input_act, style_act)
+            ]
+        )
+        content_loss = content_loss * content_weight
+        style_loss = style_loss * style_weight
+
+        total_loss = content_loss + style_loss
+        loss_dict = {'style': style_loss, 'content': content_loss}
+        return total_loss, loss_dict
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, logits), grads = grad_fn(state.params)
+    (loss, loss_dict), grads = grad_fn(state.params)
     state = state.apply_gradients(grads=grads)
-    return state, (loss, logits)
+    return state, (loss, loss_dict)
 
 
 def main(argv):
     del argv  # Unused.
 
-    rng = jax.random.PRNGKey(0)
     config = FLAGS.config
-    np.random.seed(config.np_seed)
+    rng = jax.random.PRNGKey(config.seed)
+    np.random.seed(config.seed)
     workdir = FLAGS.workdir
     if workdir is None:
         workdir = tempfile.mkdtemp(prefix='neural_style-')
 
-    examples_seen = 0
+    # load the images
+    content_img = load_image(os.path.expanduser(config.content), 256, 256)
+    style_img = load_image(os.path.expanduser(config.style), 256, 256)
 
     # setup model and state
-    rng, init_rng = jax.random.split(rng)
-    state = create_state(init_rng, config)
+    state, nn_params = create_state(content_img, config)
 
     # print model
     rng, tabulate_rng = jax.random.split(rng)
     tabulate_fn = nn.tabulate(VGG16(), tabulate_rng)
     logging.info(tabulate_fn(jnp.ones((1, 32, 32, 3))))
 
-    # train
     while state.step < config.train_steps:
-        batch = next(data_iter)
-        state, (loss, logits) = train_step(state, batch)
-
-        examples_seen += len(batch[list(batch.keys())[0]])
-        epoch_frac = examples_seen / len(train_dataset)
+        state, (_, loss_dict) = transfer_step(
+            state=state,
+            vgg_params=nn_params,
+            content_image=content_img,
+            style_image=style_img,
+            content_weight=1.0,
+            style_weight=1e6,
+        )
 
         if state.step % config.logging_interval == 0:
+            closs = loss_dict['content']
+            sloss = loss_dict['style']
             logging.info(
-                f'step {state.step} | epoch {epoch_frac:.2f} | loss {loss.item():.4f} '
-                f'| accuarcy {acc.item():.4f}'
+                f'step {state.step} | content_loss {closs.item():.4f} | '
+                f'style_loss {sloss.item():.4f}'
             )
 
         if state.step % config.eval_interval == 0:
-            import random
-
-            idx = int(random.random() * len(batch['x']))
-            i2s = lambda x: ''.join([train_dataset.itos[i] for i in x])
-            start_x = i2s(batch['x'][idx])
-            pred_x = i2s(np.array(logits.argmax(axis=-1)[idx]))
-            recon = generate_image(state, 32, 32)
             img_dir = pathlib.Path(workdir) / 'images'
             img_dir.mkdir(parents=True, exist_ok=True)
             output_path = str(img_dir / f'{state.step}.png')
-            Image.fromarray(np.array(recon)).save(output_path)
-            logging.info(
-                f'{Fore.GREEN}EVAL:{Style.RESET_ALL} qualitative\n'
-                f'{Fore.RED}ORIGINAL{Style.RESET_ALL}: {start_x}\n\n'
-                f'{Fore.RED}PRED{Style.RESET_ALL}: {pred_x}\n\n'
-            )
+            Image.fromarray(
+                np.array(jnp.clip(state.params['image'], 0, 1) * 255).astype(np.uint8)
+            ).save(output_path)
+            logging.info(f'{Fore.GREEN}EVAL:{Style.RESET_ALL} {output_path}')
 
 
 if __name__ == '__main__':
