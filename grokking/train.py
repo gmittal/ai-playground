@@ -185,7 +185,7 @@ def train_step(state, batch, config, dropout_rng):
     next_tokens = batch['y']
 
     def loss_fn(params):
-        logits = Transformer(**config, deterministic=True).apply(
+        logits = Transformer(**config, deterministic=False).apply(
             {'params': params},
             tokens,
             rngs={'dropout': dropout_rng},
@@ -218,7 +218,7 @@ def eval_step(state, batch, config):
         )
     )
     pred_tokens = logits[:, -1, :].argmax(-1)
-    sum_accuracy = jnp.sum(pred_tokens == batch['y'][:, -1])
+    sum_accuracy = jnp.sum(pred_tokens == next_tokens[:, -1])
     return sum_loss, sum_accuracy
 
 
@@ -272,7 +272,16 @@ def main(argv):
     train_iter = itertools.cycle(train_dataloader)
     examples_seen = 0
 
-    # setup model and state
+    # create learning rate
+    warmup_fn = optax.linear_schedule(
+        init_value=0.0, end_value=config.learning_rate, transition_steps=10
+    )
+    constant_fn = optax.constant_schedule(config.learning_rate)
+    learning_rate_fn = optax.join_schedules(
+        schedules=[warmup_fn, constant_fn], boundaries=[10]
+    )
+
+    # setup model, optimizer, and state
     ckpt_dir = pathlib.Path(workdir) / 'checkpoints'
     rng, init_rng = jax.random.split(rng)
     model_config = frozen_dict.FrozenDict(
@@ -290,7 +299,7 @@ def main(argv):
         'params'
     ]
     tx = optax.adamw(
-        config.learning_rate,
+        learning_rate_fn,
         b1=config.beta1,
         b2=config.beta2,
         weight_decay=config.weight_decay,
@@ -318,9 +327,10 @@ def main(argv):
         epoch_frac = examples_seen / len(train_dataset)
 
         if state.step % config.logging_interval == 0:
+            lr = learning_rate_fn(state.step)
             logging.info(
-                f'step {state.step} | epoch {epoch_frac:.2f} | loss {loss.item():.4f} '
-                f'| accuarcy {acc.item():.4f}'
+                f'step {state.step} | epoch {epoch_frac:.2f} | lr {lr:.4f} '
+                f'loss {loss.item():.4f} | accuracy {acc.item():.4f}'
             )
 
         if state.step % config.eval_interval == 0:
