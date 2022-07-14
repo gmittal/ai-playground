@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import wandb
 
 from absl import app
 from absl import flags
@@ -134,12 +135,13 @@ class Transformer(nn.Module):
 
 
 class BinaryOpDataset(Dataset):
-    def __init__(self, *, p, is_train, train_frac):
+    def __init__(self, *, p, is_train, train_frac, order):
         self.p = p
-        self.binary_op = lambda a, b: a + b
+        self.binary_op = lambda a, b: (a * pow(b, p - 2, p))
         self.is_train = is_train
         self.train_frac = train_frac
         self.offset = 0 if is_train else int(train_frac * p * p)
+        self.idx = order
 
         vocab = ['o', '='] + list(range(p))
         self.stoi = {ch: i for i, ch in enumerate(vocab)}
@@ -153,6 +155,7 @@ class BinaryOpDataset(Dataset):
     def __getitem__(self, idx):
         # a o b = binary_op(a, b) (mod p)
         idx += self.offset
+        idx = self.idx[idx]
         a = idx % self.p
         b = idx // self.p
         assert 0 <= a < self.p and 0 <= b < self.p
@@ -243,13 +246,17 @@ def main(argv):
     workdir = FLAGS.workdir
     if workdir is None:
         workdir = tempfile.mkdtemp(prefix='grokking-')
+    if config.wandb:
+        wandb.init(project='grokking', config=config)
 
     # setup data
+    order = list(range(config.p * config.p))
+    np.random.shuffle(order)
     train_dataset = BinaryOpDataset(
-        p=config.p, is_train=True, train_frac=config.train_frac
+        p=config.p, is_train=True, train_frac=config.train_frac, order=order
     )
     test_dataset = BinaryOpDataset(
-        p=config.p, is_train=False, train_frac=config.train_frac
+        p=config.p, is_train=False, train_frac=config.train_frac, order=order
     )
     train_dataloader = DataLoader(
         train_dataset,
@@ -332,13 +339,36 @@ def main(argv):
                 f'step {state.step} | epoch {epoch_frac:.2f} | lr {lr:.4f} '
                 f'loss {loss.item():.4f} | accuracy {acc.item():.4f}'
             )
+            wandb.log(
+                {
+                    'train': {
+                        'lr': lr,
+                        'loss': loss.item(),
+                        'accuracy': acc.item(),
+                        'epoch': epoch_frac,
+                        'examples': examples_seen,
+                    }
+                },
+                step=int(state.step),
+            )
 
         if state.step % config.eval_interval == 0:
             metrics = compute_metrics(state, test_dataloader, model_config)
+            val_loss = metrics['loss']
+            val_acc = metrics['accuracy']
             logging.info(
                 f'{Fore.GREEN}EVAL:{Style.RESET_ALL} step {state.step} | epoch '
-                f'{epoch_frac:.2f} | loss {metrics["loss"]:.4f} | '
-                f'accuracy {metrics["accuracy"]:.4f}'
+                f'{epoch_frac:.2f} | loss {val_loss:.4f} | '
+                f'accuracy {val_acc:.4f}'
+            )
+            wandb.log(
+                {
+                    'val': {
+                        'loss': val_loss,
+                        'accuracy': val_acc,
+                    }
+                },
+                step=int(state.step),
             )
 
         if state.step % config.ckpt_interval == 0:

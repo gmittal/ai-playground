@@ -32,8 +32,10 @@ def get_config():
     # dataloader
     config.num_workers = 0
 
-    config.logging_interval = 50
+    # logging
+    config.wandb = True
+    config.logging_interval = 10
     config.eval_interval = 100
-    config.ckpt_interval = 1000
+    config.ckpt_interval = 5000
 
     return config
