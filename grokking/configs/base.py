@@ -8,17 +8,26 @@ def get_config():
     config.np_seed = 42
 
     # optimizer
-    config.learning_rate = 3e-4 * 4
+    config.learning_rate = 1e-3
     config.beta1 = 0.9
-    config.beta2 = 0.999
-    config.batch_size = 64
-    config.train_steps = 10_000
+    config.beta2 = 0.98
+    config.weight_decay = 1.0
+    config.batch_size = 512
+    config.train_steps = 100_000
 
     # model
-    config.block_size = 128
+    config.emb_dim = 128
+    config.n_blocks = 2
+    config.n_heads = 4
+    config.block_size = 4
+
+    config.emb_dropout_prob = 0.1
+    config.attn_dropout_prob = 0.1
+    config.block_dropout_prob = 0.1
 
     # dataset
-    config.input_file = 'shakespeare.txt'
+    config.p = 97
+    config.train_frac = 0.4
 
     # dataloader
     config.num_workers = 0
