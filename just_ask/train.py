@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import torchvision
 import wandb
 
 from absl import app
@@ -19,7 +20,7 @@ from flax.core import frozen_dict
 from flax.training import train_state
 from flax.training import checkpoints
 from ml_collections import config_flags
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 
 
 Fore = colorama.Fore
@@ -34,6 +35,61 @@ config_flags.DEFINE_config_file(
     'File path to the training hyperparameter configuration.',
     lock_config=True,
 )
+
+
+class Encoder(nn.Module):
+    latents: int
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(500, name='fc1')(x)
+        x = nn.relu(x)
+        mean_x = nn.Dense(self.latents, name='fc2_mean')(x)
+        logvar_x = nn.Dense(self.latents, name='fc2_logvar')(x)
+        return mean_x, logvar_x
+
+
+class Decoder(nn.Module):
+    @nn.compact
+    def __call__(self, z):
+        z = nn.Dense(500, name='fc1')(z)
+        z = nn.relu(z)
+        z = nn.Dense(784, name='fc2')(z)
+        return z
+
+
+class VAE(nn.Module):
+    latents: int = 20
+
+    def setup(self):
+        self.encoder = Encoder(self.latents)
+        self.decoder = Decoder()
+
+    def __call__(self, x, z_rng):
+        mean, logvar = self.encoder(x)
+        z = reparameterize(z_rng, mean, logvar)
+        recon_x = self.decoder(z)
+        return recon_x, mean, logvar
+
+    def generate(self, z):
+        return nn.sigmoid(self.decoder(z))
+
+
+def reparameterize(rng, mean, logvar):
+    std = jnp.exp(0.5 * logvar)
+    eps = jax.random.normal(rng, logvar.shape)
+    return mean + eps * std
+
+
+@jax.vmap
+def kl_divergence(mean, logvar):
+    return -0.5 * jnp.sum(1 + logvar - jnp.square(mean) - jnp.exp(logvar))
+
+
+@jax.vmap
+def binary_cross_entropy_with_logits(logits, labels):
+    logits = nn.log_sigmoid(logits)
+    return -jnp.sum(labels * logits + (1.0 - labels) * jnp.log(-jnp.expm1(logits)))
 
 
 class G(nn.Module):
@@ -65,60 +121,54 @@ def numpy_collate(batch):
 
 
 @functools.partial(jax.jit, static_argnums=(2,))
-def train_step(state, batch, config, dropout_rng):
-    dropout_rng = jax.random.fold_in(dropout_rng, state.step)
-
-    tokens = batch['x']
-    next_tokens = batch['y']
+def train_step(state, batch, config, rng):
+    z_rng = jax.random.fold_in(rng, state.step)
+    images = batch['x']
 
     def loss_fn(params):
-        logits = Transformer(**config, deterministic=False).apply(
+        logits, mu, logvar = VAE(**config).apply(
             {'params': params},
-            tokens,
-            rngs={'dropout': dropout_rng},
+            images,
+            z_rng,
         )
-        chex.assert_equal_shape([logits[:, :, 0], next_tokens])
-        loss = jnp.mean(
-            optax.softmax_cross_entropy_with_integer_labels(
-                logits=logits[:, -1, :], labels=next_tokens[:, -1]
-            )
-        )
-        return loss, logits
+        chex.assert_equal_shape([logits, images])
+        bce_loss = binary_cross_entropy_with_logits(logits, images).mean()
+        kld_loss = kl_divergence(mu, logvar).mean()
+        losses = {'bce': bce_loss, 'kld': kld_loss}
+        return bce_loss + kld_loss, losses
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, logits), grads = grad_fn(state.params)
+    (loss, losses), grads = grad_fn(state.params)
     state = state.apply_gradients(grads=grads)
-    return state, (loss, logits)
+    return state, (loss, losses)
 
 
 @functools.partial(jax.jit, static_argnums=(2,))
-def eval_step(state, batch, config):
-    tokens = batch['x']
-    next_tokens = batch['y']
+def eval_step(state, batch, config, z_rng):
+    images = batch['x']
 
-    logits = Transformer(**config, deterministic=True).apply(
-        {'params': state.params}, tokens
-    )
-    sum_loss = jnp.sum(
-        optax.softmax_cross_entropy_with_integer_labels(
-            logits=logits[:, -1, :], labels=next_tokens[:, -1]
-        )
-    )
-    pred_tokens = logits[:, -1, :].argmax(-1)
-    sum_accuracy = jnp.sum(pred_tokens == next_tokens[:, -1])
-    return sum_loss, sum_accuracy
+    logits, mu, logvar = VAE(**config).apply({'params': state.params}, images, z_rng)
+    sum_bce_loss = binary_cross_entropy_with_logits(logits, images).sum()
+    sum_kld_loss = kl_divergence(mu, logvar).sum()
+    return sum_bce_loss, sum_kld_loss
 
 
-def compute_metrics(state, test_batches, config):
-    loss = 0
-    accuracy = 0
+def compute_metrics(state, test_batches, config, rng):
+    bce_loss = 0
+    kld_loss = 0
     examples_seen = 0
-    for batch in test_batches:
-        partial_sum, partial_acc = eval_step(state, batch, config)
-        loss += partial_sum.item()
-        accuracy += partial_acc.item()
+    for (images, labels) in test_batches:
+        rng, z_rng = jax.random.split(rng)
+        images = [np.array(im) / 255.0 for im in images]
+        batch = {
+            'x': jnp.array(images).reshape(len(images), -1),
+            'y': jnp.array(labels),
+        }
+        partial_bce, partial_kld = eval_step(state, batch, config, z_rng)
+        bce_loss += partial_bce.item()
+        kld_loss += partial_kld.item()
         examples_seen += len(batch[list(batch.keys())[0]])
-    return {'loss': loss / examples_seen, 'accuracy': accuracy / examples_seen}
+    return {'bce': bce_loss / examples_seen, 'kld': kld_loss / examples_seen}
 
 
 def main(argv):
@@ -135,8 +185,18 @@ def main(argv):
 
     # setup data
     train_dataset = torchvision.datasets.MNIST('/tmp/mnist', train=True, download=True)
+    test_dataset = torchvision.datasets.MNIST('/tmp/mnist', train=False, download=True)
     train_dataloader = DataLoader(
         train_dataset,
+        collate_fn=numpy_collate,
+        drop_last=False,
+        shuffle=True,
+        pin_memory=True,
+        batch_size=config.batch_size,
+        num_workers=config.num_workers,
+    )
+    test_dataloader = DataLoader(
+        test_dataset,
         collate_fn=numpy_collate,
         drop_last=False,
         shuffle=True,
@@ -149,94 +209,67 @@ def main(argv):
 
     # create learning rate schedule
     warmup_fn = optax.linear_schedule(
-        init_value=0.0, end_value=config.learning_rate, transition_steps=10
+        init_value=0.0, end_value=config.learning_rate, transition_steps=100
     )
     constant_fn = optax.constant_schedule(config.learning_rate)
     learning_rate_fn = optax.join_schedules(
-        schedules=[warmup_fn, constant_fn], boundaries=[10]
+        schedules=[warmup_fn, constant_fn], boundaries=[100]
     )
 
     # setup model, optimizer, and state
     ckpt_dir = pathlib.Path(workdir) / 'checkpoints'
-    rng, init_rng = jax.random.split(rng)
-    model_config = frozen_dict.FrozenDict(
-        token_dim=config.p + 2,
-        emb_dim=config.emb_dim,
-        n_blocks=config.n_blocks,
-        n_heads=config.n_heads,
-        block_size=config.block_size,
-        emb_dropout_prob=config.emb_dropout_prob,
-        block_dropout_prob=config.block_dropout_prob,
-        attn_dropout_prob=config.attn_dropout_prob,
-    )
-    model = Transformer(**model_config, deterministic=True)
-    params = model.init(init_rng, jnp.ones([1, config.block_size], dtype=np.int64))[
-        'params'
-    ]
+    rng, init_rng, fwd_rng = jax.random.split(rng, num=3)
+    model_config = frozen_dict.FrozenDict(latents=20)
+    model = VAE(**model_config)
+    params = model.init(init_rng, jnp.ones([1, 28 * 28]), fwd_rng)['params']
     tx = optax.adamw(
         learning_rate_fn,
-        b1=config.beta1,
-        b2=config.beta2,
-        weight_decay=config.weight_decay,
+        weight_decay=0,
     )
     state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
     state = checkpoints.restore_checkpoint(ckpt_dir, state)
 
     # print model
-    rng, tabulate_rng = jax.random.split(rng)
-    x = train_dataset[0]['x'][None, :]
+    rng, tabulate_rng, fwd_rng = jax.random.split(rng, num=3)
+    x = jnp.ones([1, 28 * 28])
     tabulate_fn = nn.tabulate(model, tabulate_rng)
-    logging.info(tabulate_fn(x))
+    logging.info(tabulate_fn(x, fwd_rng))
 
     # train
     while state.step < config.train_steps:
-        batch = next(train_iter)
-        rng, dropout_rng = jax.random.split(rng)
-        state, (loss, logits) = train_step(state, batch, model_config, dropout_rng)
+        images, labels = next(train_iter)
+        images = [np.array(im)[:, :] / 255.0 for im in images]
+        batch = {
+            'x': jnp.array(images).reshape(len(images), -1),
+            'y': jnp.array(labels),
+        }
 
-        # additional training metrics
-        pred_tokens = logits[:, -1, :].argmax(-1)
-        acc = (pred_tokens == batch['y'][:, -1]).mean()
+        rng, fwd_rng = jax.random.split(rng)
+        state, (loss, losses) = train_step(state, batch, model_config, fwd_rng)
 
         examples_seen += len(batch[list(batch.keys())[0]])
         epoch_frac = examples_seen / len(train_dataset)
 
         if state.step % config.logging_interval == 0:
             lr = learning_rate_fn(state.step)
+            bce_loss = losses['bce']
+            kld_loss = losses['kld']
             logging.info(
                 f'step {state.step} | epoch {epoch_frac:.2f} | lr {lr:.4f} '
-                f'loss {loss.item():.4f} | accuracy {acc.item():.4f}'
-            )
-            wandb.log(
-                {
-                    'train': {
-                        'lr': lr,
-                        'loss': loss.item(),
-                        'accuracy': acc.item(),
-                        'epoch': epoch_frac,
-                        'examples': examples_seen,
-                    }
-                },
-                step=int(state.step),
+                f'loss {loss.item():.4f} | bce {bce_loss.item():.4f} | '
+                f'kld {kld_loss.item():.4f}'
             )
 
         if state.step % config.eval_interval == 0:
-            metrics = compute_metrics(state, test_dataloader, model_config)
-            val_loss = metrics['loss']
-            val_acc = metrics['accuracy']
+            rng, eval_rng = jax.random.split(rng)
+            losses = compute_metrics(state, test_dataloader, model_config, eval_rng)
+            bce_loss = losses['bce']
+            kld_loss = losses['kld']
             logging.info(
-                f'{Fore.GREEN}EVAL:{Style.RESET_ALL} step {state.step} | epoch '
-                f'{epoch_frac:.2f} | loss {val_loss:.4f} | '
-                f'accuracy {val_acc:.4f}'
-            )
-            wandb.log(
-                {
-                    'val': {
-                        'loss': val_loss,
-                        'accuracy': val_acc,
-                    }
-                },
-                step=int(state.step),
+                f'{Fore.GREEN}EVAL:{Style.RESET_ALL} step {state.step} | '
+                f'epoch {epoch_frac:.2f} | lr {lr:.4f} '
+                f'loss {bce_loss+kld_loss:.4f} | bce {bce_loss:.4f} | '
+                f'kld {kld_loss:.4f}'
             )
 
         if state.step % config.ckpt_interval == 0:
