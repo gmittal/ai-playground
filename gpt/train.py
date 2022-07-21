@@ -10,18 +10,18 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import wandb
 
 from absl import app
 from absl import flags
 from absl import logging
+from flax.core import frozen_dict
 from flax.training import train_state
 from flax.training import checkpoints
 from ml_collections import config_flags
-from tensorflow_probability.substrates import jax as tfp
 from torch.utils.data import Dataset, DataLoader
 
 
-tfd = tfp.distributions
 Fore = colorama.Fore
 Style = colorama.Style
 
@@ -36,50 +36,30 @@ config_flags.DEFINE_config_file(
 )
 
 
-class Attention(nn.Module):
-    out_dim: int
-    deterministic: bool
-
-    def setup(self):
-        self.q_net = nn.Dense(self.out_dim)
-        self.k_net = nn.Dense(self.out_dim)
-        self.v_net = nn.Dense(self.out_dim)
-
-        self.proj = nn.Dense(self.out_dim)
-
-        self.attn_drop = nn.Dropout(0.1, deterministic=self.deterministic)
-        self.proj_drop = nn.Dropout(0.1, deterministic=self.deterministic)
-
-    def __call__(self, x):
-        B, T, C = x.shape
-        N, D = (self.n_heads,)
-
-        q = self.q_net(x).r
-        k = self.k_net(x)
-        v = self.v_net(x)
-
-        w = q @ k.tranpose(1, 2) / jnp.sqrt(D)
-        w = nn.softmax(w, axis=-1)
-        attention = self.attn_drop(w @ v)
-        # TODO: complete this
-        return attention
-
-
 class Block(nn.Module):
     emb_dim: int
     block_size: int
     n_heads: int
-    dropout_prob: float
     decoder_mask: jnp.ndarray
 
+    residual_dropout_prob: float
+    attn_dropout_prob: float
+    deterministic: bool
+
     def setup(self):
-        self.attention = nn.SelfAttention(num_heads=self.n_heads)
+        self.attention = nn.SelfAttention(
+            num_heads=self.n_heads,
+            dropout_rate=self.attn_dropout_prob,
+            deterministic=self.deterministic,
+        )
         self.mlp = nn.Sequential(
             [
                 nn.Dense(4 * self.emb_dim),
                 nn.gelu,
                 nn.Dense(self.emb_dim),
-                # nn.Dropout(self.dropout_prob, deterministic=self.deterministic),
+                nn.Dropout(
+                    self.residual_dropout_prob, deterministic=self.deterministic
+                ),
             ]
         )
         self.ln1 = nn.LayerNorm()
@@ -95,40 +75,51 @@ class Block(nn.Module):
         return x
 
 
-class GPT(nn.Module):
-    n_blocks: int = 4
-    n_heads: int = 4
+class Transformer(nn.Module):
+    token_dim: int
+    emb_dim: int
 
-    block_size: int = 128  # context length
-    deterministic: bool = True
+    n_blocks: int
+    n_heads: int
+    block_size: int
+
+    emb_dropout_prob: float
+    block_dropout_prob: float
+    attn_dropout_prob: float
+    deterministic: bool
 
     def setup(self):
-        vocab_size = 65
-        emb_dim = 32
-
         self.token_emb = nn.Embed(
-            num_embeddings=vocab_size,
-            features=emb_dim,
+            num_embeddings=self.token_dim,
+            features=self.emb_dim,
             embedding_init=nn.initializers.normal(stddev=1.0),
         )
-
-        # TODO: currently learnable, experiment with sinusoidal
         self.pos_embedding = self.param(
             'pos_embedding',
-            nn.initializers.normal(stddev=1 / jnp.sqrt(emb_dim)),
-            (1, self.block_size, emb_dim),
+            nn.initializers.normal(stddev=1 / jnp.sqrt(self.emb_dim)),
+            (1, self.block_size, self.emb_dim),
         )
-        self.dropout = nn.Dropout(0.1)
+        self.dropout = nn.Dropout(
+            self.emb_dropout_prob, deterministic=self.deterministic
+        )
 
         decoder_mask = nn.make_causal_mask(jnp.ones((1, self.block_size)))
         blocks = [
-            Block(emb_dim, self.block_size, self.n_heads, 0.1, decoder_mask)
+            Block(
+                emb_dim=self.emb_dim,
+                block_size=self.block_size,
+                n_heads=self.n_heads,
+                decoder_mask=decoder_mask,
+                attn_dropout_prob=self.attn_dropout_prob,
+                residual_dropout_prob=self.block_dropout_prob,
+                deterministic=self.deterministic,
+            )
             for _ in range(self.n_blocks)
         ]
         self.transformer = nn.Sequential(blocks)
 
         self.ln = nn.LayerNorm()
-        self.head = nn.Dense(vocab_size)
+        self.head = nn.Dense(self.token_dim)
 
     def __call__(self, x):
         _, t = x.shape
@@ -136,7 +127,7 @@ class GPT(nn.Module):
         emb_tokens = self.token_emb(x)
         emb_pos = self.pos_embedding[:, :t, :]
         x = emb_tokens + emb_pos
-
+        x = self.dropout(x)
         x = self.transformer(x)
         x = self.ln(x)
         x = self.head(x)
@@ -181,22 +172,29 @@ def numpy_collate(batch):
         return np.array(batch)
 
 
-def create_train_state(rng, config):
-    model = GPT()
-    params = model.init(rng, jnp.ones([1, config.block_size], dtype=np.int64))['params']
+def create_learning_rate_fn(config):
+    warmup_fn = optax.linear_schedule(
+        init_value=0.0, end_value=config.learning_rate, transition_steps=10
+    )
+    constant_fn = optax.constant_schedule(config.learning_rate)
+    learning_rate_fn = optax.join_schedules(
+        schedules=[warmup_fn, constant_fn], boundaries=[10]
+    )
+    return learning_rate_fn
 
-    # TODO: make optimizer configurable
-    tx = optax.adam(config.learning_rate, config.beta1, config.beta2)
-    return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
-
-@jax.jit
-def train_step(state, batch):
+@functools.partial(jax.jit, static_argnums=(2,))
+def train_step(state, batch, config, dropout_rng):
     tokens = batch['x']
     next_tokens = batch['y']
+    dropout_rng = jax.random.fold_in(dropout_rng, state.step)
 
     def loss_fn(params):
-        logits = state.apply_fn({'params': params}, tokens)
+        logits = Transformer(**config, deterministic=False).apply(
+            {'params': params},
+            tokens,
+            rngs={'dropout': dropout_rng},
+        )
         chex.assert_equal_shape([logits[:, :, 0], next_tokens])
         loss = jnp.mean(
             optax.softmax_cross_entropy_with_integer_labels(
@@ -211,15 +209,13 @@ def train_step(state, batch):
     return state, (loss, logits)
 
 
-def top_k(logits, k):
-    return jnp.argpartition(logits, -k, axis=-1)[:, -k:]
-
-
 @functools.partial(jax.jit, static_argnums=(2, 3, 4, 5))
-def sample(state, x, steps, temperature=1.0, sample=False, top_k=None):
+def sample(state, x, steps, config, temperature=1.0, sample=False, top_k=None):
     # TODO: implement nucleus sampling
     for _ in range(steps):
-        logits = state.apply_fn({'params': state.params}, x)
+        logits = Transformer(**config, deterministic=True).apply(
+            {'params': state.params}, x
+        )
         logits = logits[:, -1, :] / temperature
         if top_k is not None:
             logits = top_k(logits, top_k)
@@ -228,20 +224,18 @@ def sample(state, x, steps, temperature=1.0, sample=False, top_k=None):
             x = jnp.random.choice(logits.shape[-1], p=probs)
 
 
-def main(argv):
-    del argv  # Unused.
-
-    rng = jax.random.PRNGKey(0)
-    config = FLAGS.config
-    np.random.seed(config.np_seed)
+def train(config):
+    rng = jax.random.PRNGKey(config.seed)
     workdir = FLAGS.workdir
     if workdir is None:
-        workdir = tempfile.mkdtemp(prefix='gpt-jax_')
+        workdir = tempfile.mkdtemp(prefix='gpt-')
+    if config.wandb:
+        wandb.init(project='flax-gpt', config=config)
 
     # setup data
-    text_data = open(config.input_file).read()
+    text_data = open(config.data_file).read()
     train_dataset = CharDataset(text_data, config.block_size)
-    dataloader = DataLoader(
+    train_dataloader = DataLoader(
         train_dataset,
         collate_fn=numpy_collate,
         drop_last=False,
@@ -250,61 +244,84 @@ def main(argv):
         batch_size=config.batch_size,
         num_workers=config.num_workers,
     )
-    data_iter = itertools.cycle(dataloader)
+    data_iter = itertools.cycle(train_dataloader)
     examples_seen = 0
 
-    # setup model and state
-    ckpt_dir = pathlib.Path(workdir) / 'checkpoints'
+    # setup model and optimizer
     rng, init_rng = jax.random.split(rng)
-    state = create_train_state(init_rng, config)
+    model_config = frozen_dict.FrozenDict(
+        token_dim=train_dataset.vocab_size,
+        emb_dim=config.emb_dim,
+        n_blocks=config.n_blocks,
+        n_heads=config.n_heads,
+        block_size=config.block_size,
+        emb_dropout_prob=config.emb_dropout_prob,
+        block_dropout_prob=config.block_dropout_prob,
+        attn_dropout_prob=config.attn_dropout_prob,
+    )
+    model = Transformer(**model_config, deterministic=True)
+    fake_sequence = jnp.ones([1, config.block_size], dtype=jnp.int64)
+    params = model.init(init_rng, fake_sequence)['params']
+    learning_rate_fn = create_learning_rate_fn(config)
+    tx = optax.adamw(
+        learning_rate_fn,
+        b1=config.beta1,
+        b2=config.beta2,
+        weight_decay=config.weight_decay,
+    )
+    state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+    ckpt_dir = pathlib.Path(workdir) / 'checkpoints'
     state = checkpoints.restore_checkpoint(ckpt_dir, state)
 
     # print model
     rng, tabulate_rng = jax.random.split(rng)
-    x = train_dataset[0]['x'][None, :]
-    tabulate_fn = nn.tabulate(GPT(), tabulate_rng)
-    logging.info(tabulate_fn(x))
+    tabulate_fn = nn.tabulate(model, tabulate_rng)
+    logging.info(tabulate_fn(fake_sequence))
 
-    # train
     while state.step < config.train_steps:
         batch = next(data_iter)
-        state, (loss, logits) = train_step(state, batch)
-
-        # additional metrics
-        pred_tokens = logits.argmax(-1)
-        acc = (pred_tokens == batch['y']).mean()
+        rng, dropout_rng = jax.random.split(rng)
+        state, (loss, _) = train_step(state, batch, model_config, dropout_rng)
 
         examples_seen += len(batch[list(batch.keys())[0]])
         epoch_frac = examples_seen / len(train_dataset)
 
         if state.step % config.logging_interval == 0:
+            lr = learning_rate_fn(state.step)
             logging.info(
-                f'step {state.step} | epoch {epoch_frac:.2f} | loss {loss.item():.4f} '
-                f'| accuarcy {acc.item():.4f}'
+                f'step {state.step} | epoch {epoch_frac:.2f} | lr {lr:.4f} '
+                f'loss {loss.item():.4f}'
             )
+            if config.wandb:
+                wandb.log(
+                    {
+                        'train': {
+                            'lr': lr,
+                            'loss': loss.item(),
+                            'epoch': epoch_frac,
+                            'examples': examples_seen,
+                        }
+                    },
+                    step=int(state.step),
+                )
 
         if state.step % config.eval_interval == 0:
-            import random
-
-            idx = int(random.random() * len(batch['x']))
-            i2s = lambda x: ''.join([train_dataset.itos[i] for i in x])
-            start_x = i2s(batch['x'][idx])
-            pred_x = i2s(np.array(logits.argmax(axis=-1)[idx]))
-            # recon = generate_image(state, 32, 32)
-            # img_dir = pathlib.Path(workdir) / 'images'
-            # img_dir.mkdir(parents=True, exist_ok=True)
-            # output_path = str(img_dir / f'{state.step}.png')
-            # Image.fromarray(np.array(recon)).save(output_path)
-            logging.info(
-                f'{Fore.GREEN}EVAL:{Style.RESET_ALL} qualitative\n'
-                f'{Fore.RED}ORIGINAL{Style.RESET_ALL}: {start_x}\n\n'
-                f'{Fore.RED}PRED{Style.RESET_ALL}: {pred_x}\n\n'
-            )
+            pass
 
         if state.step % config.ckpt_interval == 0:
             checkpoints.save_checkpoint(
                 ckpt_dir, state, int(state.step), keep=float('inf')
             )
+
+    return state
+
+
+def main(argv):
+    del argv  # Unused.
+
+    config = FLAGS.config
+    np.random.seed(config.seed)
+    _ = train(config)
 
 
 if __name__ == '__main__':

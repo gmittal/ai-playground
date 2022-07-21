@@ -339,18 +339,19 @@ def main(argv):
                 f'step {state.step} | epoch {epoch_frac:.2f} | lr {lr:.4f} '
                 f'loss {loss.item():.4f} | accuracy {acc.item():.4f}'
             )
-            wandb.log(
-                {
-                    'train': {
-                        'lr': lr,
-                        'loss': loss.item(),
-                        'accuracy': acc.item(),
-                        'epoch': epoch_frac,
-                        'examples': examples_seen,
-                    }
-                },
-                step=int(state.step),
-            )
+            if config.wandb:
+                wandb.log(
+                    {
+                        'train': {
+                            'lr': lr,
+                            'loss': loss.item(),
+                            'accuracy': acc.item(),
+                            'epoch': epoch_frac,
+                            'examples': examples_seen,
+                        }
+                    },
+                    step=int(state.step),
+                )
 
         if state.step % config.eval_interval == 0:
             metrics = compute_metrics(state, test_dataloader, model_config)
@@ -361,15 +362,16 @@ def main(argv):
                 f'{epoch_frac:.2f} | loss {val_loss:.4f} | '
                 f'accuracy {val_acc:.4f}'
             )
-            wandb.log(
-                {
-                    'val': {
-                        'loss': val_loss,
-                        'accuracy': val_acc,
-                    }
-                },
-                step=int(state.step),
-            )
+            if config.wandb:
+                wandb.log(
+                    {
+                        'val': {
+                            'loss': val_loss,
+                            'accuracy': val_acc,
+                        }
+                    },
+                    step=int(state.step),
+                )
 
         if state.step % config.ckpt_interval == 0:
             checkpoints.save_checkpoint(
