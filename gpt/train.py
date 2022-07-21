@@ -149,15 +149,20 @@ class CharDataset(Dataset):
     def __len__(self):
         return len(self.data) - self.block_size
 
+    def encode(self, chunk):
+        # Use int32 for now due to https://github.com/google/jax#current-gotchas
+        return np.array([self.stoi[s] for s in chunk], dtype=np.int32)
+
+    def decode(self, x):
+        return ''.join([self.itos[i] for i in x])
+
     def __getitem__(self, idx):
         # grab a chunk of (block_size + 1) characters from the data
         chunk = self.data[idx : idx + self.block_size + 1]
 
         # encode every character to an integer
-        dix = [self.stoi[s] for s in chunk]
-        x = np.array(dix[:-1], dtype=np.int64)
-        y = np.array(dix[1:], dtype=np.int64)
-        return {'x': x, 'y': y}
+        dix = self.encode(chunk)
+        return {'x': dix[:-1], 'y': dix[1:]}
 
 
 def numpy_collate(batch):
@@ -209,19 +214,26 @@ def train_step(state, batch, config, dropout_rng):
     return state, (loss, logits)
 
 
-@functools.partial(jax.jit, static_argnums=(2, 3, 4, 5))
-def sample(state, x, steps, config, temperature=1.0, sample=False, top_k=None):
+# @functools.partial(jax.jit, static_argnums=(2, 3, 4))
+def sample(state, x, steps, config, temperature=1.0):
     # TODO: implement nucleus sampling
     for _ in range(steps):
         logits = Transformer(**config, deterministic=True).apply(
             {'params': state.params}, x
         )
         logits = logits[:, -1, :] / temperature
-        if top_k is not None:
-            logits = top_k(logits, top_k)
-        probs = nn.softmax(axis=-1)
-        if sample:
-            x = jnp.random.choice(logits.shape[-1], p=probs)
+        probs = nn.softmax(logits, axis=-1)
+
+        # naive argmax sampling
+        next_token = jnp.argmax(probs, axis=-1)
+        x = jnp.concatenate([x, next_token[None]], axis=1)
+
+        # if top_k is not None:
+        #     logits = top_k(logits, top_k)
+        # probs = nn.softmax(axis=-1)
+        # if sample:
+        #     x = jnp.random.choice(logits.shape[-1], p=probs)
+    return x
 
 
 def train(config):
@@ -229,10 +241,11 @@ def train(config):
     workdir = FLAGS.workdir
     if workdir is None:
         workdir = tempfile.mkdtemp(prefix='gpt-')
+    logging.info(f'workdir: {workdir}')
     if config.wandb:
         wandb.init(project='flax-gpt', config=config)
 
-    # setup data
+    # setup data pipeline
     text_data = open(config.data_file).read()
     train_dataset = CharDataset(text_data, config.block_size)
     train_dataloader = DataLoader(
@@ -260,7 +273,7 @@ def train(config):
         attn_dropout_prob=config.attn_dropout_prob,
     )
     model = Transformer(**model_config, deterministic=True)
-    fake_sequence = jnp.ones([1, config.block_size], dtype=jnp.int64)
+    fake_sequence = jnp.ones([1, config.block_size], dtype=jnp.int32)
     params = model.init(init_rng, fake_sequence)['params']
     learning_rate_fn = create_learning_rate_fn(config)
     tx = optax.adamw(
@@ -306,7 +319,15 @@ def train(config):
                 )
 
         if state.step % config.eval_interval == 0:
-            pass
+            seq = sample(
+                state,
+                jnp.zeros((1, 1), dtype=jnp.int32),
+                5,
+                model_config,
+            )
+            import pdb
+
+            pdb.set_trace()
 
         if state.step % config.ckpt_interval == 0:
             checkpoints.save_checkpoint(

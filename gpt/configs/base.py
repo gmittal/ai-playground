@@ -19,7 +19,7 @@ def get_config():
     config.emb_dim = 128
     config.n_blocks = 2
     config.n_heads = 4
-    config.block_size = 4
+    config.block_size = 64
 
     config.emb_dropout_prob = 0.1
     config.attn_dropout_prob = 0.1
@@ -34,7 +34,7 @@ def get_config():
     # logging
     config.wandb = False
     config.logging_interval = 10
-    config.eval_interval = 100
+    config.eval_interval = 50
     config.ckpt_interval = 5000
 
     return config
