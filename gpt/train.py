@@ -215,25 +215,44 @@ def train_step(state, batch, config, dropout_rng):
 
 
 # @functools.partial(jax.jit, static_argnums=(2, 3, 4))
-def sample(state, x, steps, config, temperature=1.0):
+def sample(state, prompt, max_steps, config, temperature=1.0):
+    """
+    Autoregressive decoding from the model.
+
+    Args:
+        state: Optimized model parameters.
+        prompt: Encoded sequences of indices to use as the prompt (B, T).
+        max_steps: Maximum number of tokens to generate.
+        config: Model configuration.
+        temperature: Temperature to use for sampling.
+
+    Returns:
+        A generated sequence of indices.
+    """
+    block_size = config['block_size']
+    if max_steps > block_size:
+        raise ValueError(
+            'max_steps must be less than or equal to block_size, got %d > %d'
+            % (max_steps, block_size)
+        )
+
+    # TODO: be more specific about semantics of max_steps
+    _, prompt_len = prompt.shape
+    prompt = jnp.pad(prompt, ((0, 0), (0, block_size - prompt_len)))
+
     # TODO: implement nucleus sampling
-    for _ in range(steps):
+    def sample_step(i, tokens):
         logits = Transformer(**config, deterministic=True).apply(
-            {'params': state.params}, x
+            {'params': state.params}, tokens
         )
         logits = logits[:, -1, :] / temperature
         probs = nn.softmax(logits, axis=-1)
-
         # naive argmax sampling
         next_token = jnp.argmax(probs, axis=-1)
-        x = jnp.concatenate([x, next_token[None]], axis=1)
+        return tokens.at[:, i].set(next_token)
 
-        # if top_k is not None:
-        #     logits = top_k(logits, top_k)
-        # probs = nn.softmax(axis=-1)
-        # if sample:
-        #     x = jnp.random.choice(logits.shape[-1], p=probs)
-    return x
+    seq = jax.lax.fori_loop(prompt_len, max_steps, sample_step, prompt)
+    return seq
 
 
 def train(config):
@@ -321,13 +340,11 @@ def train(config):
         if state.step % config.eval_interval == 0:
             seq = sample(
                 state,
-                jnp.zeros((1, 1), dtype=jnp.int32),
-                5,
+                jnp.zeros((4, 1), dtype=jnp.int32),
+                config.block_size,
                 model_config,
             )
-            import pdb
-
-            pdb.set_trace()
+            print(train_dataset.decode(np.array(seq[0])))
 
         if state.step % config.ckpt_interval == 0:
             checkpoints.save_checkpoint(

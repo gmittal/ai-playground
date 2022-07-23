@@ -8,7 +8,7 @@ def get_config():
     config.seed = 42
 
     # optimizer
-    config.learning_rate = 3e-4
+    config.learning_rate = 1e-3
     config.beta1 = 0.9
     config.beta2 = 0.98
     config.weight_decay = 0.0
