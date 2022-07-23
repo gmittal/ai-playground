@@ -8,18 +8,19 @@ def get_config():
     config.seed = 42
 
     # optimizer
-    config.learning_rate = 6e-4
+    config.learning_rate = 1e-3
     config.beta1 = 0.9
-    config.beta2 = 0.999
-    config.weight_decay = 0.0
-    config.batch_size = 512
+    config.beta2 = 0.95
+    config.weight_decay = 0.1
+    config.grad_norm_clip = 1.0
+    config.batch_size = 64
     config.train_steps = 100_000
 
     # model
-    config.emb_dim = 256
-    config.n_blocks = 8
-    config.n_heads = 8
-    config.block_size = 128
+    config.emb_dim = 64
+    config.n_blocks = 2
+    config.n_heads = 4
+    config.block_size = 64
 
     config.emb_dropout_prob = 0.1
     config.attn_dropout_prob = 0.1

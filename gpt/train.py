@@ -5,8 +5,9 @@ import itertools
 import pathlib
 import tempfile
 
-# import chex
+import chex
 import colorama
+import flax
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
@@ -95,6 +96,7 @@ class Transformer(nn.Module):
             features=self.emb_dim,
             embedding_init=nn.initializers.normal(stddev=1.0),
         )
+        # TODO: try sinusoidal embedding initializer
         self.pos_embedding = self.param(
             'pos_embedding',
             nn.initializers.normal(stddev=1 / jnp.sqrt(self.emb_dim)),
@@ -189,6 +191,28 @@ def create_learning_rate_fn(config):
     return learning_rate_fn
 
 
+def create_weight_decay_param_mask(p):
+    def filter_fn(param_name):
+        # avoid all biases, layer norms, and embeddings
+        if (
+            param_name.endswith('bias')
+            or 'ln' in param_name
+            or param_name.endswith('embedding')
+        ):
+            return False
+
+        # everything else should be fine
+        return True
+
+    p = flax.traverse_util.ModelParamTraversal(lambda x, _: filter_fn(x)).update(
+        lambda _: True, p
+    )
+    p = flax.traverse_util.ModelParamTraversal(lambda x, _: not filter_fn(x)).update(
+        lambda _: False, p
+    )
+    return p
+
+
 @functools.partial(jax.jit, static_argnums=(2,))
 def train_step(state, batch, config, dropout_rng):
     tokens = batch['x']
@@ -201,7 +225,7 @@ def train_step(state, batch, config, dropout_rng):
             tokens,
             rngs={'dropout': dropout_rng},
         )
-        # chex.assert_equal_shape([logits[:, :, 0], next_tokens])
+        chex.assert_equal_shape([logits[:, :, 0], next_tokens])
         loss = jnp.mean(
             optax.softmax_cross_entropy_with_integer_labels(
                 logits=logits, labels=next_tokens
@@ -299,9 +323,6 @@ def train(config):
     data_iter = itertools.cycle(train_dataloader)
     examples_seen = 0
 
-    import pdb; pdb.set_trace()
-
-
     # setup model and optimizer
     rng, init_rng = jax.random.split(rng)
     model_config = frozen_dict.FrozenDict(
@@ -318,11 +339,15 @@ def train(config):
     fake_sequence = jnp.ones([1, config.block_size], dtype=jnp.int32)
     params = model.init(init_rng, fake_sequence)['params']
     learning_rate_fn = create_learning_rate_fn(config)
-    tx = optax.adamw(
-        learning_rate_fn,
-        b1=config.beta1,
-        b2=config.beta2,
-        weight_decay=config.weight_decay,
+    tx = optax.chain(
+        optax.clip_by_global_norm(config.grad_norm_clip),
+        optax.adamw(
+            learning_rate_fn,
+            b1=config.beta1,
+            b2=config.beta2,
+            weight_decay=config.weight_decay,
+            mask=create_weight_decay_param_mask,
+        ),
     )
     state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
     ckpt_dir = pathlib.Path(workdir) / 'checkpoints'
