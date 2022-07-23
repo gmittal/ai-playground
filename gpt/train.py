@@ -1,9 +1,11 @@
+#!/usr/bin/python
+
 import functools
 import itertools
 import pathlib
 import tempfile
 
-import chex
+# import chex
 import colorama
 import flax.linen as nn
 import jax
@@ -20,7 +22,6 @@ from flax.training import train_state
 from flax.training import checkpoints
 from ml_collections import config_flags
 from torch.utils.data import Dataset, DataLoader
-
 
 Fore = colorama.Fore
 Style = colorama.Style
@@ -200,7 +201,7 @@ def train_step(state, batch, config, dropout_rng):
             tokens,
             rngs={'dropout': dropout_rng},
         )
-        chex.assert_equal_shape([logits[:, :, 0], next_tokens])
+        # chex.assert_equal_shape([logits[:, :, 0], next_tokens])
         loss = jnp.mean(
             optax.softmax_cross_entropy_with_integer_labels(
                 logits=logits, labels=next_tokens
@@ -214,8 +215,16 @@ def train_step(state, batch, config, dropout_rng):
     return state, (loss, logits)
 
 
-# @functools.partial(jax.jit, static_argnums=(2, 3, 4))
-def sample(state, prompt, max_steps, config, temperature=1.0):
+def top_k_logits(logits, k):
+    B, _ = logits.shape
+    topk_idx = jnp.argsort(-logits, axis=-1)[:, :k]
+    rows, _ = jnp.indices((B, k))
+    k_vals = jnp.min(logits[rows, topk_idx], axis=-1)
+    return jnp.where(logits < k_vals[:, None], float('-inf'), logits)
+
+
+@functools.partial(jax.jit, static_argnums=(2, 3, 5, 6))
+def sample(state, prompt, max_steps, config, rng, temperature=1.0, top_k=10):
     """
     Autoregressive decoding from the model.
 
@@ -224,7 +233,9 @@ def sample(state, prompt, max_steps, config, temperature=1.0):
         prompt: Encoded sequences of indices to use as the prompt (B, T).
         max_steps: Maximum number of tokens to generate.
         config: Model configuration.
+        rng: random number generator.
         temperature: Temperature to use for sampling.
+        top_k: Top k logits used for sampling.
 
     Returns:
         A generated sequence of indices.
@@ -238,17 +249,26 @@ def sample(state, prompt, max_steps, config, temperature=1.0):
 
     # TODO: be more specific about semantics of max_steps
     _, prompt_len = prompt.shape
+
+    # jit doesn't like changing shapes, so we pad to block_size
     prompt = jnp.pad(prompt, ((0, 0), (0, block_size - prompt_len)))
 
-    # TODO: implement nucleus sampling
     def sample_step(i, tokens):
         logits = Transformer(**config, deterministic=True).apply(
             {'params': state.params}, tokens
         )
-        logits = logits[:, -1, :] / temperature
-        probs = nn.softmax(logits, axis=-1)
-        # naive argmax sampling
-        next_token = jnp.argmax(probs, axis=-1)
+        # TODO: add <sos> token so we can generate without prompt
+        # to predict the i-th token we must use the logit from the prev position
+        logits = logits[:, i - 1, :] / temperature
+        # probs = nn.softmax(logits, axis=-1)
+
+        # TODO: implement nucleus sampling
+        # next_token = jnp.argmax(probs, axis=-1)  # naive argmax sampling
+
+        sample_rng = jax.random.fold_in(rng, i)
+        masked_logits = top_k_logits(logits, top_k)
+        next_token = jax.random.categorical(sample_rng, masked_logits, axis=-1)
+
         return tokens.at[:, i].set(next_token)
 
     seq = jax.lax.fori_loop(prompt_len, max_steps, sample_step, prompt)
@@ -278,6 +298,9 @@ def train(config):
     )
     data_iter = itertools.cycle(train_dataloader)
     examples_seen = 0
+
+    import pdb; pdb.set_trace()
+
 
     # setup model and optimizer
     rng, init_rng = jax.random.split(rng)
@@ -321,7 +344,7 @@ def train(config):
         if state.step % config.logging_interval == 0:
             lr = learning_rate_fn(state.step)
             logging.info(
-                f'step {state.step} | epoch {epoch_frac:.2f} | lr {lr:.4f} '
+                f'step {state.step} | epoch {epoch_frac:.2f} | lr {lr:.4f} | '
                 f'loss {loss.item():.4f}'
             )
             if config.wandb:
@@ -338,11 +361,13 @@ def train(config):
                 )
 
         if state.step % config.eval_interval == 0:
+            rng, sample_rng = jax.random.split(rng)
             seq = sample(
                 state,
-                jnp.zeros((4, 1), dtype=jnp.int32),
+                jnp.array(train_dataset.encode("O God! O God!"))[None, :],
                 config.block_size,
                 model_config,
+                sample_rng,
             )
             print(train_dataset.decode(np.array(seq[0])))
 

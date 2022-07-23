@@ -1,0 +1,30 @@
+// gpunode
+
+var xhr = new XMLHttpRequest();
+xhr.open("POST", "https://lambdalabs.com/api/cloud/instances-rpc", true);
+xhr.setRequestHeader('Content-Type', 'application/json');
+xhr.send(JSON.stringify({
+    method: "launch",
+    params: {ttype: "gpu.1x.rtx6000",
+             quantity: 1,
+             public_key_id: "be49bd118ea048a0b3fa50602e1f4d76",
+             filesystem_id: null}
+}));
+
+// terminate
+
+var xhr = new XMLHttpRequest();
+xhr.open("POST", "https://lambdalabs.com/api/cloud/instances-rpc", true);
+xhr.setRequestHeader('Content-Type', 'application/json');
+xhr.send(JSON.stringify({
+    method: "terminate",
+    params: {instance_ids: ["76c2add9c98c481291ba714ec5d400ed"]}
+}));
+
+// list instances
+
+fetch("https://lambdalabs.com/api/cloud/instances").then(function(response) {
+  return response.json();
+}).then(res => {
+    console.log(res.data)
+});
