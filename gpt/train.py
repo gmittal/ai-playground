@@ -54,6 +54,7 @@ class Block(nn.Module):
             dropout_rate=self.attn_dropout_prob,
             deterministic=self.deterministic,
         )
+        # TODO: Use GPT-2 weight initialization scheme
         self.mlp = nn.Sequential(
             [
                 nn.Dense(4 * self.emb_dim),
