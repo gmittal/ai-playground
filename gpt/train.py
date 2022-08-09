@@ -5,6 +5,7 @@ import tempfile
 
 import chex
 import colorama
+import distrax
 import flax
 import flax.linen as nn
 import jax
@@ -246,55 +247,63 @@ def top_k_logits(logits, k):
     return jnp.where(logits < k_vals[:, None], float('-inf'), logits)
 
 
+def top_p_logits(logits, p):
+    """Nucleus sampling"""
+    B, C = logits.shape
+    sorted_idx = jnp.argsort(-logits, axis=-1)
+    rows, _ = jnp.indices((B, C))
+    sorted_logits = logits[rows, sorted_idx]
+    cdf = jnp.cumsum(nn.softmax(sorted_logits, axis=-1), axis=-1)
+    cutoff_idx = jnp.sum(cdf <= p, axis=-1)
+    cutoff_vals = jnp.min(sorted_logits[rows, cutoff_idx[:, None]], axis=-1)
+    return jnp.where(logits < cutoff_vals[:, None], float('-inf'), logits)
+
+
 @functools.partial(jax.jit, static_argnums=(2, 3, 5, 6))
-def sample(state, prompt, max_steps, config, rng, temperature=1.0, top_k=10):
+def sample(state, prompt, steps, config, rng, temperature=1.0, top_k=None, top_p=0.9):
     """
     Autoregressive decoding from the model.
 
     Args:
         state: Optimized model parameters.
         prompt: Encoded sequences of indices to use as the prompt (B, T).
-        max_steps: Maximum number of tokens to generate.
+        steps: Number of tokens to generate.
         config: Model configuration.
         rng: random number generator.
         temperature: Temperature to use for sampling.
         top_k: Top k logits used for sampling.
+        top_p: Logits masked based on CDF accumulation used for nucleus sampling.
 
     Returns:
-        A generated sequence of indices.
+        A generated sequence of indices of shape (B, T + steps)
     """
+    assert steps >= 0, 'steps must be >= 0'
+
+    B, prompt_len = prompt.shape
+    prompt = jnp.pad(prompt, ((0, 0), (0, steps)))  # shape (B, prompt_len + steps)
     block_size = config['block_size']
-    if max_steps > block_size:
-        raise ValueError(
-            'max_steps must be less than or equal to block_size, got %d > %d'
-            % (max_steps, block_size)
-        )
-
-    # TODO: be more specific about semantics of max_steps
-    _, prompt_len = prompt.shape
-
-    # jit doesn't like changing shapes, so we pad to block_size
-    prompt = jnp.pad(prompt, ((0, 0), (0, block_size - prompt_len)))
 
     def sample_step(i, tokens):
+        window_start = jnp.where(i < block_size, 0, i - block_size)
         logits = Transformer(**config, deterministic=True).apply(
-            {'params': state.params}, tokens
+            {'params': state.params},
+            jax.lax.dynamic_slice(tokens, (0, window_start), (B, block_size)),
         )
+
         # TODO: add <sos> token so we can generate without prompt
         # to predict the i-th token we must use the logit from the prev position
-        logits = logits[:, i - 1, :] / temperature
-        # probs = nn.softmax(logits, axis=-1)
-
-        # TODO: implement nucleus sampling
-        # next_token = jnp.argmax(probs, axis=-1)  # naive argmax sampling
+        logits = logits[:, jnp.where(i < block_size, i - 1, -1), :] / temperature
+        if top_k is not None:
+            logits = top_k_logits(logits, top_k)
+        if top_p is not None:
+            logits = top_p_logits(logits, top_p)
 
         sample_rng = jax.random.fold_in(rng, i)
-        masked_logits = top_k_logits(logits, top_k)
-        next_token = jax.random.categorical(sample_rng, masked_logits, axis=-1)
-
+        next_token_dist = distrax.Categorical(logits=logits)
+        next_token = next_token_dist.sample(seed=sample_rng)
         return tokens.at[:, i].set(next_token)
 
-    seq = jax.lax.fori_loop(prompt_len, max_steps, sample_step, prompt)
+    seq = jax.lax.fori_loop(prompt_len, prompt_len + steps, sample_step, prompt)
     return seq
 
 
@@ -389,7 +398,7 @@ def train(config):
             seq = sample(
                 state,
                 jnp.array(train_dataset.encode("O God! O God!"))[None, :],
-                config.block_size,
+                2000,
                 model_config,
                 sample_rng,
             )
