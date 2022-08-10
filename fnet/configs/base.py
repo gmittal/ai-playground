@@ -8,9 +8,9 @@ def get_config():
     config.seed = 42
 
     # optimizer
-    config.learning_rate = 5e-4
-    config.lr_warmup_steps = 3_000
-    config.lr_cosine_decay = True
+    config.learning_rate = 3e-4
+    config.lr_warmup_steps = 0
+    config.lr_cosine_decay = False
 
     config.beta1 = 0.9
     config.beta2 = 0.95
@@ -20,9 +20,8 @@ def get_config():
     config.train_steps = 250_000
 
     # model
-    config.emb_dim = 48
-    config.n_blocks = 3
-    config.n_heads = 3
+    config.emb_dim = 192
+    config.n_blocks = 4
     config.block_size = 128
 
     config.emb_dropout_prob = 0.1

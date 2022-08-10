@@ -58,17 +58,14 @@ def two_dim_matmul(x, matrix_dim_one, matrix_dim_two):
     )
 
 
-class FourierMixer(nn.Module):
+class CausalFourierMixer(nn.Module):
     @nn.compact
-    def __call__(self, x, mask=None, dft_mat_seq=None, dft_mat_hidden=None):
+    def __call__(self, x, dft_mat_seq=None, dft_mat_hidden=None):
         assert dft_mat_seq is not None and dft_mat_hidden is not None
-        dft_seq = dft_mat_seq * mask[0][0]  # apply causal mask
-        chex.assert_equal_shape([dft_mat_seq, dft_seq])
-
         matmul = jax.vmap(
             functools.partial(
                 two_dim_matmul,
-                matrix_dim_one=dft_seq,
+                matrix_dim_one=dft_mat_seq,
                 matrix_dim_two=dft_mat_hidden,
             )
         )
@@ -78,8 +75,6 @@ class FourierMixer(nn.Module):
 class Block(nn.Module):
     emb_dim: int
     block_size: int
-    n_heads: int
-    decoder_mask: jnp.ndarray
 
     residual_dropout_prob: float
     deterministic: bool
@@ -87,7 +82,7 @@ class Block(nn.Module):
     n_blocks: int = 1  # for residual projection initialization
 
     def setup(self):
-        self.mixer = FourierMixer()
+        self.mixer = CausalFourierMixer()
         self.mlp = nn.Sequential(
             [
                 Dense(4 * self.emb_dim),
@@ -108,10 +103,8 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm()
 
     def __call__(self, x, dft_mat_seq=None, dft_mat_hidden=None):
-        B, T, _ = x.shape
-        causal_mask = nn.make_causal_mask(jnp.ones((B, T)))
         x = x + self.mixer(
-            x, mask=causal_mask, dft_mat_seq=dft_mat_seq, dft_mat_hidden=dft_mat_hidden
+            x, dft_mat_seq=dft_mat_seq, dft_mat_hidden=dft_mat_hidden
         )
         x = self.ln1(x)
         x = x + self.mlp(x)
@@ -124,7 +117,6 @@ class FNet(nn.Module):
     emb_dim: int
 
     n_blocks: int
-    n_heads: int
     block_size: int
 
     emb_dropout_prob: float
@@ -147,14 +139,11 @@ class FNet(nn.Module):
             self.emb_dropout_prob, deterministic=self.deterministic
         )
 
-        decoder_mask = nn.make_causal_mask(jnp.ones((1, self.block_size)))
         self.blocks = [
             Block(
                 emb_dim=self.emb_dim,
                 block_size=self.block_size,
-                n_heads=self.n_heads,
                 n_blocks=self.n_blocks,  # for residual projection initialization
-                decoder_mask=decoder_mask,
                 residual_dropout_prob=self.block_dropout_prob,
                 deterministic=self.deterministic,
             )
@@ -404,12 +393,17 @@ def train(config):
         token_dim=train_dataset.vocab_size,
         emb_dim=config.emb_dim,
         n_blocks=config.n_blocks,
-        n_heads=config.n_heads,
         block_size=config.block_size,
         emb_dropout_prob=config.emb_dropout_prob,
         block_dropout_prob=config.block_dropout_prob,
     )
-    dft_mat_seq = jnp.asarray(linalg.dft(config.block_size))
+
+    # create causal-masked DFT
+    dft_mat_seq = linalg.dft(config.block_size)
+    for i in range(config.block_size):
+        row = np.pad(linalg.dft(i + 1)[i, :], ((0), (config.block_size - (i + 1))))
+        dft_mat_seq[i, :] = row
+    dft_mat_seq = jnp.asarray(dft_mat_seq)
     dft_mat_hidden = jnp.asarray(linalg.dft(config.emb_dim))
 
     model = FNet(**model_config, deterministic=True)
