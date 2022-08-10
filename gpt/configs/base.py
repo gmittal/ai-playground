@@ -9,12 +9,15 @@ def get_config():
 
     # optimizer
     config.learning_rate = 5e-4
+    config.lr_warmup_steps = 3_000
+    config.lr_cosine_decay = True
+
     config.beta1 = 0.9
     config.beta2 = 0.95
     config.weight_decay = 0.1
     config.grad_norm_clip = 1.0
     config.batch_size = 64
-    config.train_steps = 500_000
+    config.train_steps = 250_000
 
     # model
     config.emb_dim = 192
@@ -34,7 +37,7 @@ def get_config():
 
     # logging
     config.wandb = False
-    config.logging_interval = 100
+    config.logging_interval = 50
     config.eval_interval = 500
     config.ckpt_interval = 1000
 

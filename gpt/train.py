@@ -36,6 +36,13 @@ config_flags.DEFINE_config_file(
     lock_config=True,
 )
 
+# use GPT initializations
+Dense = functools.partial(
+    nn.Dense,
+    kernel_init=nn.initializers.normal(stddev=0.02),
+    bias_init=nn.initializers.zeros,
+)
+
 
 class Block(nn.Module):
     emb_dim: int
@@ -47,18 +54,25 @@ class Block(nn.Module):
     attn_dropout_prob: float
     deterministic: bool
 
+    n_blocks: int = 1  # for residual projection initialization
+
     def setup(self):
         self.attention = nn.SelfAttention(
             num_heads=self.n_heads,
             dropout_rate=self.attn_dropout_prob,
             deterministic=self.deterministic,
         )
-        # TODO: Use GPT-2 weight initialization scheme
         self.mlp = nn.Sequential(
             [
-                nn.Dense(4 * self.emb_dim),
+                Dense(4 * self.emb_dim),
                 nn.gelu,
-                nn.Dense(self.emb_dim),
+                nn.Dense(
+                    self.emb_dim,
+                    kernel_init=nn.initializers.normal(
+                        stddev=0.02 / jnp.sqrt(2 * self.n_blocks)
+                    ),
+                    bias_init=nn.initializers.zeros,
+                ),
                 nn.Dropout(
                     self.residual_dropout_prob, deterministic=self.deterministic
                 ),
@@ -94,7 +108,7 @@ class Transformer(nn.Module):
         self.token_emb = nn.Embed(
             num_embeddings=self.token_dim,
             features=self.emb_dim,
-            embedding_init=nn.initializers.normal(stddev=1.0),
+            embedding_init=nn.initializers.normal(stddev=0.02),
         )
         # TODO: try sinusoidal embedding initializer
         self.pos_embedding = self.param(
@@ -112,6 +126,7 @@ class Transformer(nn.Module):
                 emb_dim=self.emb_dim,
                 block_size=self.block_size,
                 n_heads=self.n_heads,
+                n_blocks=self.n_blocks,  # for residual projection initialization
                 decoder_mask=decoder_mask,
                 attn_dropout_prob=self.attn_dropout_prob,
                 residual_dropout_prob=self.block_dropout_prob,
@@ -122,7 +137,7 @@ class Transformer(nn.Module):
         self.transformer = nn.Sequential(blocks)
 
         self.ln = nn.LayerNorm()
-        self.head = nn.Dense(self.token_dim)
+        self.head = Dense(self.token_dim)
 
     def __call__(self, x):
         _, t = x.shape
@@ -182,11 +197,20 @@ def numpy_collate(batch):
 
 def create_learning_rate_fn(config):
     warmup_fn = optax.linear_schedule(
-        init_value=0.0, end_value=config.learning_rate, transition_steps=10
+        init_value=0.0,
+        end_value=config.learning_rate,
+        transition_steps=config.lr_warmup_steps,
     )
-    constant_fn = optax.constant_schedule(config.learning_rate)
+    if config.lr_cosine_decay:
+        decay_steps = config.train_steps - config.lr_warmup_steps
+        opt_fn = optax.cosine_decay_schedule(
+            init_value=config.learning_rate, decay_steps=decay_steps
+        )
+    else:
+        opt_fn = optax.constant_schedule(config.learning_rate)
+
     learning_rate_fn = optax.join_schedules(
-        schedules=[warmup_fn, constant_fn], boundaries=[10]
+        schedules=[warmup_fn, opt_fn], boundaries=[config.lr_warmup_steps]
     )
     return learning_rate_fn
 
@@ -259,7 +283,7 @@ def top_p_logits(logits, p):
     return jnp.where(logits < cutoff_vals[:, None], float('-inf'), logits)
 
 
-@functools.partial(jax.jit, static_argnums=(2, 3, 5, 6))
+@functools.partial(jax.jit, static_argnums=(2, 3, 5, 6, 7))
 def sample(state, prompt, steps, config, rng, temperature=1.0, top_k=None, top_p=0.9):
     """
     Autoregressive decoding from the model.
