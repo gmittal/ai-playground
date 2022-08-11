@@ -1,13 +1,5 @@
 """
-FNet: Mixing Tokens with Fourier Transforms
-
-In the original paper, they replace attention layers with a Fourier transform but only
-run experiments on encoder models. I attempted to do the same but for a decoder-only
-model for text generation. After a long time of training (200K steps) it does learn to
-generate high-level structure and some ok patterns, but it is nowhere near as sample
-efficient as the original model using self-attention. Perhaps with more tuning and
-double-checking of the DFT causal masking this could be made to work, but signs of life
-are fairly limited at this point.
+Pretrained Transformers As Universal Computation Engines
 """
 
 import functools
@@ -33,7 +25,6 @@ from flax.core import frozen_dict
 from flax.training import train_state
 from flax.training import checkpoints
 from ml_collections import config_flags
-from scipy import linalg
 from torch.utils.data import Dataset, DataLoader
 
 Fore = colorama.Fore
@@ -57,44 +48,24 @@ Dense = functools.partial(
 )
 
 
-@jax.jit
-def two_dim_matmul(x, matrix_dim_one, matrix_dim_two):
-    """Applies 2D matrix multiplication to 2D input arrays."""
-    return jnp.einsum(
-        "ij,jk,ni->nk",
-        x,
-        matrix_dim_two,
-        matrix_dim_one,
-        optimize=True,
-        precision=jax.lax.Precision.DEFAULT,
-    )
-
-
-class CausalFourierMixer(nn.Module):
-    @nn.compact
-    def __call__(self, x, dft_mat_seq=None, dft_mat_hidden=None):
-        assert dft_mat_seq is not None and dft_mat_hidden is not None
-        matmul = jax.vmap(
-            functools.partial(
-                two_dim_matmul,
-                matrix_dim_one=dft_mat_seq,
-                matrix_dim_two=dft_mat_hidden,
-            )
-        )
-        return matmul(x).real
-
-
 class Block(nn.Module):
     emb_dim: int
     block_size: int
+    n_heads: int
+    decoder_mask: jnp.ndarray
 
     residual_dropout_prob: float
+    attn_dropout_prob: float
     deterministic: bool
 
     n_blocks: int = 1  # for residual projection initialization
 
     def setup(self):
-        self.mixer = CausalFourierMixer()
+        self.attention = nn.SelfAttention(
+            num_heads=self.n_heads,
+            dropout_rate=self.attn_dropout_prob,
+            deterministic=self.deterministic,
+        )
         self.mlp = nn.Sequential(
             [
                 Dense(4 * self.emb_dim),
@@ -114,23 +85,27 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm()
         self.ln2 = nn.LayerNorm()
 
-    def __call__(self, x, dft_mat_seq=None, dft_mat_hidden=None):
-        x = x + self.mixer(x, dft_mat_seq=dft_mat_seq, dft_mat_hidden=dft_mat_hidden)
+    def __call__(self, x):
+        B, T, _ = x.shape
+        causal_mask = nn.make_causal_mask(jnp.ones((B, T)))
+        x = x + self.attention(x, causal_mask)
         x = self.ln1(x)
         x = x + self.mlp(x)
         x = self.ln2(x)
         return x
 
 
-class FNet(nn.Module):
+class Transformer(nn.Module):
     token_dim: int
     emb_dim: int
 
     n_blocks: int
+    n_heads: int
     block_size: int
 
     emb_dropout_prob: float
     block_dropout_prob: float
+    attn_dropout_prob: float
     deterministic: bool
 
     def setup(self):
@@ -149,29 +124,33 @@ class FNet(nn.Module):
             self.emb_dropout_prob, deterministic=self.deterministic
         )
 
-        self.blocks = [
+        decoder_mask = nn.make_causal_mask(jnp.ones((1, self.block_size)))
+        blocks = [
             Block(
                 emb_dim=self.emb_dim,
                 block_size=self.block_size,
+                n_heads=self.n_heads,
                 n_blocks=self.n_blocks,  # for residual projection initialization
+                decoder_mask=decoder_mask,
+                attn_dropout_prob=self.attn_dropout_prob,
                 residual_dropout_prob=self.block_dropout_prob,
                 deterministic=self.deterministic,
             )
             for _ in range(self.n_blocks)
         ]
+        self.transformer = nn.Sequential(blocks)
 
         self.ln = nn.LayerNorm()
         self.head = Dense(self.token_dim)
 
-    def __call__(self, x, dft_mat_seq=None, dft_mat_hidden=None):
+    def __call__(self, x):
         _, t = x.shape
 
         emb_tokens = self.token_emb(x)
         emb_pos = self.pos_embedding[:, :t, :]
         x = emb_tokens + emb_pos
         x = self.dropout(x)
-        for block in self.blocks:
-            x = block(x, dft_mat_seq=dft_mat_seq, dft_mat_hidden=dft_mat_hidden)
+        x = self.transformer(x)
         x = self.ln(x)
         x = self.head(x)
         return x
@@ -263,17 +242,15 @@ def create_weight_decay_param_mask(p):
 
 
 @functools.partial(jax.jit, static_argnums=(2,))
-def train_step(state, batch, config, dft_mat_seq, dft_mat_hidden, dropout_rng):
+def train_step(state, batch, config, dropout_rng):
     tokens = batch['x']
     next_tokens = batch['y']
     dropout_rng = jax.random.fold_in(dropout_rng, state.step)
 
     def loss_fn(params):
-        logits = FNet(**config, deterministic=False).apply(
+        logits = Transformer(**config, deterministic=False).apply(
             {'params': params},
             tokens,
-            dft_mat_seq,
-            dft_mat_hidden,
             rngs={'dropout': dropout_rng},
         )
         chex.assert_equal_shape([logits[:, :, 0], next_tokens])
@@ -310,19 +287,8 @@ def top_p_logits(logits, p):
     return jnp.where(logits < cutoff_vals[:, None], float('-inf'), logits)
 
 
-@functools.partial(jax.jit, static_argnums=(2, 3, 7, 8, 9))
-def sample(
-    state,
-    prompt,
-    steps,
-    config,
-    dft_mat_seq,
-    dft_mat_hidden,
-    rng,
-    temperature=1.0,
-    top_k=None,
-    top_p=0.9,
-):
+@functools.partial(jax.jit, static_argnums=(2, 3, 5, 6, 7))
+def sample(state, prompt, steps, config, rng, temperature=1.0, top_k=None, top_p=0.9):
     """
     Autoregressive decoding from the model.
 
@@ -331,8 +297,6 @@ def sample(
         prompt: Encoded sequences of indices to use as the prompt (B, T).
         steps: Number of tokens to generate.
         config: Model configuration.
-        dft_mat_seq: DFT matrix for the sequence.
-        dft_mat_hidden: DFT matrix for the hidden state.
         rng: random number generator.
         temperature: Temperature to use for sampling.
         top_k: Top k logits used for sampling.
@@ -349,11 +313,9 @@ def sample(
 
     def sample_step(i, tokens):
         window_start = jnp.where(i < block_size, 0, i - block_size)
-        logits = FNet(**config, deterministic=True).apply(
+        logits = Transformer(**config, deterministic=True).apply(
             {'params': state.params},
             jax.lax.dynamic_slice(tokens, (0, window_start), (B, block_size)),
-            dft_mat_seq,
-            dft_mat_hidden,
         )
 
         # TODO: add <sos> token so we can generate without prompt
@@ -380,7 +342,7 @@ def train(config):
         workdir = tempfile.mkdtemp(prefix='gpt-')
     logging.info(f'workdir: {workdir}')
     if config.wandb:
-        wandb.init(project='flax-fnet', config=config)
+        wandb.init(project='flax-gpt', config=config)
 
     # setup data pipeline
     text_data = open(config.data_file).read()
@@ -403,22 +365,15 @@ def train(config):
         token_dim=train_dataset.vocab_size,
         emb_dim=config.emb_dim,
         n_blocks=config.n_blocks,
+        n_heads=config.n_heads,
         block_size=config.block_size,
         emb_dropout_prob=config.emb_dropout_prob,
         block_dropout_prob=config.block_dropout_prob,
+        attn_dropout_prob=config.attn_dropout_prob,
     )
-
-    # create causal-masked DFT
-    dft_mat_seq = linalg.dft(config.block_size)
-    for i in range(config.block_size):
-        row = np.pad(linalg.dft(i + 1)[i, :], ((0), (config.block_size - (i + 1))))
-        dft_mat_seq[i, :] = row
-    dft_mat_seq = jnp.asarray(dft_mat_seq)
-    dft_mat_hidden = jnp.asarray(linalg.dft(config.emb_dim))
-
-    model = FNet(**model_config, deterministic=True)
+    model = Transformer(**model_config, deterministic=True)
     fake_sequence = jnp.ones([1, config.block_size], dtype=jnp.int32)
-    params = model.init(init_rng, fake_sequence, dft_mat_seq, dft_mat_hidden)['params']
+    params = model.init(init_rng, fake_sequence)['params']
     learning_rate_fn = create_learning_rate_fn(config)
     tx = optax.chain(
         optax.clip_by_global_norm(config.grad_norm_clip),
@@ -437,14 +392,12 @@ def train(config):
     # print model
     rng, tabulate_rng = jax.random.split(rng)
     tabulate_fn = nn.tabulate(model, tabulate_rng)
-    logging.info(tabulate_fn(fake_sequence, dft_mat_seq, dft_mat_hidden))
+    logging.info(tabulate_fn(fake_sequence))
 
     while state.step < config.train_steps:
         batch = next(data_iter)
         rng, dropout_rng = jax.random.split(rng)
-        state, (loss, _) = train_step(
-            state, batch, model_config, dft_mat_seq, dft_mat_hidden, dropout_rng
-        )
+        state, (loss, _) = train_step(state, batch, model_config, dropout_rng)
 
         examples_seen += len(batch[list(batch.keys())[0]])
         epoch_frac = examples_seen / len(train_dataset)
@@ -475,8 +428,6 @@ def train(config):
                 jnp.array(train_dataset.encode("O God! O God!"))[None, :],
                 2000,
                 model_config,
-                dft_mat_seq,
-                dft_mat_hidden,
                 sample_rng,
             )
             print(train_dataset.decode(np.array(seq[0])))
