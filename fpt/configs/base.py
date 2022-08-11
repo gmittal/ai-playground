@@ -16,7 +16,7 @@ def get_config():
     config.beta2 = 0.95
     config.grad_norm_clip = 1.0
     config.batch_size = 1024
-    config.train_steps = 10_000
+    config.train_steps = 30_000
 
     # model
     config.emb_dim = 128
@@ -30,7 +30,7 @@ def get_config():
 
     # dataset
     config.p = 97
-    config.train_frac = 0.8
+    config.train_frac = 0.6
 
     # dataloader
     config.num_workers = 0
