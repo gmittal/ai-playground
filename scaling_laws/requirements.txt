@@ -1,0 +1,6 @@
+jax==0.3.14
+jaxlib==0.3.14
+flax==0.5.1
+optax
+ml_collections
+distrax
