@@ -37,8 +37,8 @@ def get_config():
     config.num_workers = 0
 
     # logging
-    config.wandb = False
-    config.logging_interval = 1  # 50
+    config.wandb = True
+    config.logging_interval = 100
     config.eval_interval = 500
     config.ckpt_interval = 1000
 

@@ -1,3 +1,5 @@
+"""Scaling Laws for Neural Language Models"""
+
 import functools
 import itertools
 import pathlib
@@ -281,7 +283,7 @@ def train(config):
         workdir = tempfile.mkdtemp(prefix='gpt-')
     logging.info(f'workdir: {workdir}')
     if config.wandb:
-        wandb.init(project='flax-gpt', config=config)
+        wandb.init(project='gpt-scaling', config=config)
 
     # setup data pipeline
     text_data = open(config.data_file).read()
