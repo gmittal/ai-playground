@@ -235,6 +235,19 @@ def create_weight_decay_param_mask(p):
     return p
 
 
+def count_non_embedding_params(params, embedding_params=['token_emb', 'pos_embedding']):
+    def count_param_fn(tree):
+        return sum(
+            jax.tree_util.tree_map(lambda x: x.size, jax.tree_util.tree_leaves(tree))
+        )
+
+    total_param_count = count_param_fn(params)
+    emb_param_count = 0
+    for param_name in embedding_params:
+        emb_param_count += count_param_fn(params[param_name])
+    return total_param_count - emb_param_count
+
+
 @functools.partial(jax.jit, static_argnums=(2,))
 def train_step(state, batch, config, dropout_rng):
     tokens = batch['x']
@@ -319,6 +332,9 @@ def train(config):
     rng, tabulate_rng = jax.random.split(rng)
     tabulate_fn = nn.tabulate(model, tabulate_rng)
     logging.info(tabulate_fn(fake_sequence))
+    logging.info(
+        f'Non-embedding parameters: {count_non_embedding_params(params) / 1e6:.3f}M'
+    )
 
     while state.step < config.train_steps:
         batch = next(data_iter)

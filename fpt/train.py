@@ -9,7 +9,6 @@ import tempfile
 
 import chex
 import colorama
-import distrax
 import flax
 import flax.linen as nn
 import jax
