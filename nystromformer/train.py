@@ -1,5 +1,6 @@
 import functools
 import itertools
+import math
 import pathlib
 import tempfile
 
@@ -45,7 +46,9 @@ Dense = functools.partial(
 )
 
 
-class NystromAttention(nn.Module):
+class Attention(nn.Module):
+    """Causal self-attention."""
+
     num_heads: int
     dropout_rate: float
     deterministic: bool
@@ -53,18 +56,102 @@ class NystromAttention(nn.Module):
     num_landmarks = 256
     mp_iters = 6
 
-    def setup(self):
-        pass
-
+    @nn.compact
     def __call__(self, x):
-        return x
+        B, T, emb_dim = x.shape
+        causal_mask = jnp.tril(jnp.ones((T, T)))[None, None, :, :]
+
+        qkv = Dense(3 * emb_dim)(x)
+        q, k, v = jnp.split(qkv, 3, axis=-1)
+        k = k.reshape(B, T, self.num_heads, emb_dim // self.num_heads).transpose(0, 2, 1, 3)
+        q = q.reshape(B, T, self.num_heads, emb_dim // self.num_heads).transpose(0, 2, 1, 3)
+        v = v.reshape(B, T, self.num_heads, emb_dim // self.num_heads).transpose(0, 2, 1, 3)
+
+        attn = q @ k.transpose(0, 1, 3, 2) * (1.0 / jnp.sqrt(k.shape[-1]))
+        causal_attn = jnp.where(causal_mask == 0, float('-inf'), attn)
+        causal_softmax_attn = nn.softmax(causal_attn, axis=-1)
+        drop_attn = nn.Dropout(self.dropout_rate, deterministic=self.deterministic)(causal_softmax_attn)
+        y = drop_attn @ v
+        y = y.transpose(0, 2, 1, 3).reshape(B, T, emb_dim)
+
+        proj_y = Dense(emb_dim)(y)
+        y = nn.Dropout(self.dropout_rate, deterministic=self.deterministic)(proj_y)
+        return y
+
+
+class NystromAttention(nn.Module):
+    """Causal Nystrom self-attention."""
+
+    num_heads: int
+    dropout_rate: float
+    deterministic: bool
+
+    num_landmarks = 64 # 256
+    mp_iters = 6
+
+    @nn.compact
+    def __call__(self, x):
+        B, T, emb_dim = x.shape
+
+        # pad for landmarks
+        if T % self.num_landmarks:
+            padding = self.num_landmarks - (T % self.num_landmarks)
+            x = jnp.pad(x, ((0, 0), (padding, 0), (0, 0)))
+
+        # same as before (accounting for padding)
+        qkv = Dense(3 * emb_dim)(x)
+        q, k, v = jnp.split(qkv, 3, axis=-1)
+        _, padded_T, _ = x.shape
+        head_dim = emb_dim // self.num_heads
+        k = k.reshape(B, padded_T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+        q = q.reshape(B, padded_T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+        v = v.reshape(B, padded_T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+
+        q = q * 1 / jnp.sqrt(head_dim)
+
+        # landmark generation
+        l = math.ceil(T / self.num_landmarks)
+        landmark_einops_eq = '... (n l) d -> ... n d'
+        q_landmarks = reduce(q, landmark_einops_eq, 'sum', l=l)
+        k_landmarks = reduce(k, landmark_einops_eq, 'sum', l=l)
+        q_landmarks /= l
+        k_landmarks /= l
+
+        # similarity matrix computation
+        einops_eq = '... i d, ... j d -> ... i j'
+        q_kl = jnp.einsum(einops_eq, q, k_landmarks)
+        ql_kl = jnp.einsum(einops_eq, q_landmarks, k_landmarks)
+        ql_k = jnp.einsum(einops_eq, q_landmarks, k)
+
+        # causal masking
+        q_kl_mask = jnp.tril(jnp.ones(q_kl.shape[-2:]))[None, None, ...]
+        ql_kl_mask = jnp.tril(jnp.ones(ql_kl.shape[-2:]))[None, None, ...]
+        ql_k_mask = jnp.tril(jnp.ones(ql_k.shape[-2:]))[None, None, ...]
+
+        causal_q_kl = jnp.where(q_kl_mask == 0, float('-inf'), q_kl)
+        causal_ql_kl = jnp.where(ql_kl_mask == 0, float('-inf'), ql_kl)
+        causal_ql_k = jnp.where(ql_k_mask == 0, float('-inf'), ql_k)
+
+        # softmax
+        F_t = nn.softmax(causal_q_kl, axis=-1)
+        A = nn.softmax(causal_ql_kl, axis=-1)
+        B_t = nn.softmax(causal_ql_k, axis=-1)
+        A_t = moore_penrose_iter_pinv(A, iters=self.mp_iters)
+
+        attn = F_t @ A_t @ B_t
+        drop_attn = nn.Dropout(self.dropout_rate, deterministic=self.deterministic)(attn)
+        y = drop_attn @ v
+        y = y.transpose(0, 2, 1, 3).reshape(B, T, emb_dim)
+
+        proj_y = Dense(emb_dim)(y)
+        y = nn.Dropout(self.dropout_rate, deterministic=self.deterministic)(proj_y)
+        return y
 
 
 class Block(nn.Module):
     emb_dim: int
     block_size: int
     n_heads: int
-    decoder_mask: jnp.ndarray
 
     residual_dropout_prob: float
     attn_dropout_prob: float
@@ -73,7 +160,7 @@ class Block(nn.Module):
     n_blocks: int = 1  # for residual projection initialization
 
     def setup(self):
-        self.attention = nn.SelfAttention(
+        self.attention = NystromAttention(
             num_heads=self.n_heads,
             dropout_rate=self.attn_dropout_prob,
             deterministic=self.deterministic,
@@ -99,8 +186,7 @@ class Block(nn.Module):
 
     def __call__(self, x):
         B, T, _ = x.shape
-        causal_mask = nn.make_causal_mask(jnp.ones((B, T)))
-        x = x + self.attention(x, causal_mask)
+        x = x + self.attention(x)
         x = self.ln1(x)
         x = x + self.mlp(x)
         x = self.ln2(x)
@@ -136,14 +222,12 @@ class Transformer(nn.Module):
             self.emb_dropout_prob, deterministic=self.deterministic
         )
 
-        decoder_mask = nn.make_causal_mask(jnp.ones((1, self.block_size)))
         blocks = [
             Block(
                 emb_dim=self.emb_dim,
                 block_size=self.block_size,
                 n_heads=self.n_heads,
                 n_blocks=self.n_blocks,  # for residual projection initialization
-                decoder_mask=decoder_mask,
                 attn_dropout_prob=self.attn_dropout_prob,
                 residual_dropout_prob=self.block_dropout_prob,
                 deterministic=self.deterministic,
