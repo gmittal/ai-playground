@@ -46,6 +46,22 @@ Dense = functools.partial(
 )
 
 
+def moore_penrose_iter_pinv(x, iters=6):
+    abs_x = jnp.abs(x)
+    col = abs_x.sum(axis=-1)
+    row = abs_x.sum(axis=-2)
+    z = rearrange(x, '... i j -> ... j i') / (jnp.max(col) * jnp.max(row))
+
+    I = jnp.eye(x.shape[-1])
+    I = rearrange(I, 'i j -> () i j')
+
+    for _ in range(iters):
+        xz = x @ z
+        z = 0.25 * z @ (13 * I - (xz @ (15 * I - (xz @ (7 * I - xz)))))
+
+    return z
+
+
 class Attention(nn.Module):
     """Causal self-attention."""
 
@@ -86,7 +102,7 @@ class NystromAttention(nn.Module):
     dropout_rate: float
     deterministic: bool
 
-    num_landmarks = 64 # 256
+    num_landmarks = 64
     mp_iters = 6
 
     @nn.compact
@@ -128,9 +144,9 @@ class NystromAttention(nn.Module):
         ql_kl_mask = jnp.tril(jnp.ones(ql_kl.shape[-2:]))[None, None, ...]
         ql_k_mask = jnp.tril(jnp.ones(ql_k.shape[-2:]))[None, None, ...]
 
-        causal_q_kl = jnp.where(q_kl_mask == 0, float('-inf'), q_kl)
-        causal_ql_kl = jnp.where(ql_kl_mask == 0, float('-inf'), ql_kl)
-        causal_ql_k = jnp.where(ql_k_mask == 0, float('-inf'), ql_k)
+        causal_q_kl = q_kl #jnp.where(q_kl_mask == 0, float('-inf'), q_kl)
+        causal_ql_kl = ql_kl #jnp.where(ql_kl_mask == 0, float('-inf'), ql_kl)
+        causal_ql_k = ql_k #jnp.where(ql_k_mask == 0, float('-inf'), ql_k)
 
         # softmax
         F_t = nn.softmax(causal_q_kl, axis=-1)
@@ -142,6 +158,9 @@ class NystromAttention(nn.Module):
         drop_attn = nn.Dropout(self.dropout_rate, deterministic=self.deterministic)(attn)
         y = drop_attn @ v
         y = y.transpose(0, 2, 1, 3).reshape(B, T, emb_dim)
+
+
+        # TODO: Conv2D. Follow paper/lucidrains impl exactly. Probably need to add residual depthwise conv to resolve training stability.
 
         proj_y = Dense(emb_dim)(y)
         y = nn.Dropout(self.dropout_rate, deterministic=self.deterministic)(proj_y)
@@ -493,16 +512,18 @@ def train(config):
     while state.step < config.train_steps:
         batch = next(data_iter)
         rng, dropout_rng = jax.random.split(rng)
-        state, (loss, _) = train_step(state, batch, model_config, dropout_rng)
+        state, (loss, logits) = train_step(state, batch, model_config, dropout_rng)
 
         examples_seen += len(batch[list(batch.keys())[0]])
         epoch_frac = examples_seen / len(train_dataset)
+
+        accuracy = jnp.mean(logits.argmax(-1) == batch['y'])
 
         if state.step % config.logging_interval == 0:
             lr = learning_rate_fn(state.step)
             logging.info(
                 f'step {state.step} | epoch {epoch_frac:.2f} | lr {lr:.4f} | '
-                f'loss {loss.item():.4f}'
+                f'loss {loss.item():.4f} | acc {accuracy.item():.4f}'
             )
             if config.wandb:
                 wandb.log(
@@ -522,7 +543,7 @@ def train(config):
             seq = sample(
                 state,
                 jnp.array(train_dataset.encode("O God! O God!"))[None, :],
-                2000,
+                config.block_size,
                 model_config,
                 sample_rng,
             )
@@ -536,33 +557,8 @@ def train(config):
     return state
 
 
-def moore_penrose_iter_pinv(x, iters=6):
-    abs_x = jnp.abs(x)
-    col = abs_x.sum(axis=-1)
-    row = abs_x.sum(axis=-2)
-    z = rearrange(x, '... i j -> ... j i') / (jnp.max(col) * jnp.max(row))
-
-    I = jnp.eye(x.shape[-1])
-    I = rearrange(I, 'i j -> () i j')
-
-    for _ in range(iters):
-        xz = x @ z
-        z = 0.25 * z @ (13 * I - (xz @ (15 * I - (xz @ (7 * I - xz)))))
-
-    return z
-
-
 def main(argv):
     del argv  # Unused.
-
-
-    rng = jax.random.PRNGKey(0)
-    A = jax.random.normal(rng, (512, 512))
-    A_inv = jax.numpy.linalg.pinv(A)
-
-    A_inv2 = moore_penrose_iter_pinv(A, iters=50)
-
-    # import pdb; pdb.set_trace()
 
     config = FLAGS.config
     np.random.seed(config.seed)
