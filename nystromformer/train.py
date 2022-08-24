@@ -103,7 +103,7 @@ class NystromAttention(nn.Module):
     deterministic: bool
 
     residual_conv_kernel = 33
-    num_landmarks = 128
+    num_landmarks = 32
     mp_iters = 6
 
     @nn.compact
@@ -127,27 +127,18 @@ class NystromAttention(nn.Module):
         q = q * 1.0 / jnp.sqrt(head_dim)
 
         # landmark generation
-        # l = math.ceil(T / self.num_landmarks)
-        # landmark_einops_eq = '... (n l) d -> ... n d'
-        # q_landmarks = reduce(q, landmark_einops_eq, 'sum', l=l)
-        # k_landmarks = reduce(k, landmark_einops_eq, 'sum', l=l)
-        # q_landmarks /= l
-        # k_landmarks /= l
-
-        # TODO: hypothesis is that landmarks are leaking tokens
-        q_landmarks = q
-        k_landmarks = k
+        l = math.ceil(T / self.num_landmarks)
+        landmark_einops_eq = '... (n l) d -> ... n d'
+        q_landmarks = reduce(q, landmark_einops_eq, 'sum', l=l)
+        k_landmarks = reduce(k, landmark_einops_eq, 'sum', l=l)
+        q_landmarks /= l
+        k_landmarks /= l
 
         # similarity matrix computation
-        # einops_eq = '... i d, ... j d -> ... i j'
-        # q_kl = jnp.einsum(einops_eq, q, k_landmarks)
-        # ql_kl = jnp.einsum(einops_eq, q_landmarks, k_landmarks)
-        # ql_k = jnp.einsum(einops_eq, q_landmarks, k)
-
-        attn = q @ k.transpose(0, 1, 3, 2)
-        q_kl = attn
-        ql_kl = attn
-        ql_k = attn
+        # attn = q @ k.transpose(0, 1, 3, 2)
+        q_kl = q @ k_landmarks.transpose(0, 1, 3, 2)
+        ql_kl = q_landmarks @ k_landmarks.transpose(0, 1, 3, 2)
+        ql_k = q_landmarks @ k.transpose(0, 1, 3, 2)
 
         # causal masking
         q_kl_mask = jnp.tril(jnp.ones(q_kl.shape[-2:]))[None, None, ...]
