@@ -102,7 +102,8 @@ class NystromAttention(nn.Module):
     dropout_rate: float
     deterministic: bool
 
-    num_landmarks = 64
+    residual_conv_kernel = 33
+    num_landmarks = 128
     mp_iters = 6
 
     @nn.compact
@@ -110,9 +111,9 @@ class NystromAttention(nn.Module):
         B, T, emb_dim = x.shape
 
         # pad for landmarks
-        if T % self.num_landmarks:
-            padding = self.num_landmarks - (T % self.num_landmarks)
-            x = jnp.pad(x, ((0, 0), (padding, 0), (0, 0)))
+        # if T % self.num_landmarks:
+        #     padding = self.num_landmarks - (T % self.num_landmarks)
+        #     x = jnp.pad(x, ((0, 0), (padding, 0), (0, 0)))
 
         # same as before (accounting for padding)
         qkv = Dense(3 * emb_dim)(x)
@@ -123,45 +124,68 @@ class NystromAttention(nn.Module):
         q = q.reshape(B, padded_T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
         v = v.reshape(B, padded_T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
 
-        q = q * 1 / jnp.sqrt(head_dim)
+        q = q * 1.0 / jnp.sqrt(head_dim)
 
         # landmark generation
-        l = math.ceil(T / self.num_landmarks)
-        landmark_einops_eq = '... (n l) d -> ... n d'
-        q_landmarks = reduce(q, landmark_einops_eq, 'sum', l=l)
-        k_landmarks = reduce(k, landmark_einops_eq, 'sum', l=l)
-        q_landmarks /= l
-        k_landmarks /= l
+        # l = math.ceil(T / self.num_landmarks)
+        # landmark_einops_eq = '... (n l) d -> ... n d'
+        # q_landmarks = reduce(q, landmark_einops_eq, 'sum', l=l)
+        # k_landmarks = reduce(k, landmark_einops_eq, 'sum', l=l)
+        # q_landmarks /= l
+        # k_landmarks /= l
+
+        # TODO: hypothesis is that landmarks are leaking tokens
+        q_landmarks = q
+        k_landmarks = k
 
         # similarity matrix computation
-        einops_eq = '... i d, ... j d -> ... i j'
-        q_kl = jnp.einsum(einops_eq, q, k_landmarks)
-        ql_kl = jnp.einsum(einops_eq, q_landmarks, k_landmarks)
-        ql_k = jnp.einsum(einops_eq, q_landmarks, k)
+        # einops_eq = '... i d, ... j d -> ... i j'
+        # q_kl = jnp.einsum(einops_eq, q, k_landmarks)
+        # ql_kl = jnp.einsum(einops_eq, q_landmarks, k_landmarks)
+        # ql_k = jnp.einsum(einops_eq, q_landmarks, k)
+
+        attn = q @ k.transpose(0, 1, 3, 2)
+        q_kl = attn
+        ql_kl = attn
+        ql_k = attn
 
         # causal masking
         q_kl_mask = jnp.tril(jnp.ones(q_kl.shape[-2:]))[None, None, ...]
         ql_kl_mask = jnp.tril(jnp.ones(ql_kl.shape[-2:]))[None, None, ...]
         ql_k_mask = jnp.tril(jnp.ones(ql_k.shape[-2:]))[None, None, ...]
 
-        causal_q_kl = q_kl #jnp.where(q_kl_mask == 0, float('-inf'), q_kl)
-        causal_ql_kl = ql_kl #jnp.where(ql_kl_mask == 0, float('-inf'), ql_kl)
-        causal_ql_k = ql_k #jnp.where(ql_k_mask == 0, float('-inf'), ql_k)
+        causal_q_kl = jnp.where(q_kl_mask == 0, float('-inf'), q_kl)
+        causal_ql_kl = jnp.where(ql_kl_mask == 0, float('-inf'), ql_kl)
+        causal_ql_k = jnp.where(ql_k_mask == 0, float('-inf'), ql_k)
 
         # softmax
         F_t = nn.softmax(causal_q_kl, axis=-1)
-        A = nn.softmax(causal_ql_kl, axis=-1)
+        A_t = nn.softmax(causal_ql_kl, axis=-1)
         B_t = nn.softmax(causal_ql_k, axis=-1)
-        A_t = moore_penrose_iter_pinv(A, iters=self.mp_iters)
+        # A = moore_penrose_iter_pinv(ql_kl, iters=self.mp_iters)
 
-        attn = F_t @ A_t @ B_t
-        drop_attn = nn.Dropout(self.dropout_rate, deterministic=self.deterministic)(attn)
-        y = drop_attn @ v
+        # HACK: Since A_t is approximate, it can leak token information so need to mask it again.
+        # A_t = jnp.where(ql_kl_mask == 0, 0., A_t)
+
+        # y = (F_t @ A_t) @ (B_t @ v)  # (B, num_heads, T, head_dim)
+        y = (F_t @ A_t) @ (B_t @ v)
+
+        # import pdb; pdb.set_trace()
+
+        # apply residual convolution for improved training
+        # v_t = v.transpose(0, 2, 3, 1)
+        # res_conv = nn.Conv(self.num_heads,
+        #                    (self.residual_conv_kernel, 1),
+        #                    padding=(self.residual_conv_kernel // 2, 0),
+        #                    feature_group_count=self.num_heads,
+        #                    use_bias=False)(v_t)
+        # res_conv = res_conv.transpose(0, 3, 1, 2)
+        # y = y + res_conv
+
+        # y = F_t @ v
+
+        # combine heads
         y = y.transpose(0, 2, 1, 3).reshape(B, T, emb_dim)
-
-
-        # TODO: Conv2D. Follow paper/lucidrains impl exactly. Probably need to add residual depthwise conv to resolve training stability.
-
         proj_y = Dense(emb_dim)(y)
         y = nn.Dropout(self.dropout_rate, deterministic=self.deterministic)(proj_y)
         return y

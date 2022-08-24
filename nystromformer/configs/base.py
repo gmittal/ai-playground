@@ -23,7 +23,7 @@ def get_config():
     config.emb_dim = 192
     config.n_blocks = 6
     config.n_heads = 6
-    config.block_size = 256
+    config.block_size = 128
 
     config.emb_dropout_prob = 0.1
     config.attn_dropout_prob = 0.1
