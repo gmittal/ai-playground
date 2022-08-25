@@ -1,3 +1,12 @@
+"""Nystromformer: A Nystrom-based Algorithm for Approximating Self-Attention
+
+This is an extension of the paper, which designs a linear self-attention mechanism
+using a low-rank matrix that is generated using landmarks selected from the input. The
+goal was to train a GPT-style decoder-only LM using this, but enforcing causal masking
+with the landmark selection scheme (average pooling) in the paper ended up being too
+hard. To deal with this, the landmarks are learned parameters.
+"""
+
 import functools
 import itertools
 import math
@@ -79,14 +88,22 @@ class Attention(nn.Module):
 
         qkv = Dense(3 * emb_dim)(x)
         q, k, v = jnp.split(qkv, 3, axis=-1)
-        k = k.reshape(B, T, self.num_heads, emb_dim // self.num_heads).transpose(0, 2, 1, 3)
-        q = q.reshape(B, T, self.num_heads, emb_dim // self.num_heads).transpose(0, 2, 1, 3)
-        v = v.reshape(B, T, self.num_heads, emb_dim // self.num_heads).transpose(0, 2, 1, 3)
+        k = k.reshape(B, T, self.num_heads, emb_dim // self.num_heads).transpose(
+            0, 2, 1, 3
+        )
+        q = q.reshape(B, T, self.num_heads, emb_dim // self.num_heads).transpose(
+            0, 2, 1, 3
+        )
+        v = v.reshape(B, T, self.num_heads, emb_dim // self.num_heads).transpose(
+            0, 2, 1, 3
+        )
 
         attn = q @ k.transpose(0, 1, 3, 2) * (1.0 / jnp.sqrt(k.shape[-1]))
         causal_attn = jnp.where(causal_mask == 0, float('-inf'), attn)
         causal_softmax_attn = nn.softmax(causal_attn, axis=-1)
-        drop_attn = nn.Dropout(self.dropout_rate, deterministic=self.deterministic)(causal_softmax_attn)
+        drop_attn = nn.Dropout(self.dropout_rate, deterministic=self.deterministic)(
+            causal_softmax_attn
+        )
         y = drop_attn @ v
         y = y.transpose(0, 2, 1, 3).reshape(B, T, emb_dim)
 
@@ -110,32 +127,28 @@ class NystromAttention(nn.Module):
     def __call__(self, x):
         B, T, emb_dim = x.shape
 
-        # pad for landmarks
-        # if T % self.num_landmarks:
-        #     padding = self.num_landmarks - (T % self.num_landmarks)
-        #     x = jnp.pad(x, ((0, 0), (padding, 0), (0, 0)))
-
-        # same as before (accounting for padding)
         qkv = Dense(3 * emb_dim)(x)
         q, k, v = jnp.split(qkv, 3, axis=-1)
-        _, padded_T, _ = x.shape
         head_dim = emb_dim // self.num_heads
-        k = k.reshape(B, padded_T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
-        q = q.reshape(B, padded_T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
-        v = v.reshape(B, padded_T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+        k = k.reshape(B, T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+        q = q.reshape(B, T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+        v = v.reshape(B, T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
 
         q = q * 1.0 / jnp.sqrt(head_dim)
 
-        # landmark generation
-        l = math.ceil(T / self.num_landmarks)
-        landmark_einops_eq = '... (n l) d -> ... n d'
-        q_landmarks = reduce(q, landmark_einops_eq, 'sum', l=l)
-        k_landmarks = reduce(k, landmark_einops_eq, 'sum', l=l)
-        q_landmarks /= l
-        k_landmarks /= l
+        # landmarks
+        q_landmarks = self.param(
+            'q_landmarks',
+            nn.initializers.normal(stddev=1 / jnp.sqrt(head_dim)),
+            (1, 1, self.num_landmarks, head_dim),
+        )
+        k_landmarks = self.param(
+            'k_landmarks',
+            nn.initializers.normal(stddev=1 / jnp.sqrt(head_dim)),
+            (1, 1, self.num_landmarks, head_dim),
+        )
 
         # similarity matrix computation
-        # attn = q @ k.transpose(0, 1, 3, 2)
         q_kl = q @ k_landmarks.transpose(0, 1, 3, 2)
         ql_kl = q_landmarks @ k_landmarks.transpose(0, 1, 3, 2)
         ql_k = q_landmarks @ k.transpose(0, 1, 3, 2)
@@ -151,29 +164,24 @@ class NystromAttention(nn.Module):
 
         # softmax
         F_t = nn.softmax(causal_q_kl, axis=-1)
-        A_t = nn.softmax(causal_ql_kl, axis=-1)
+        A = nn.softmax(causal_ql_kl, axis=-1)
         B_t = nn.softmax(causal_ql_k, axis=-1)
-        # A = moore_penrose_iter_pinv(ql_kl, iters=self.mp_iters)
+        A_t = moore_penrose_iter_pinv(A, iters=self.mp_iters)
+        A_t = jnp.where(ql_kl_mask == 0, 0.0, A_t)
 
-        # HACK: Since A_t is approximate, it can leak token information so need to mask it again.
-        # A_t = jnp.where(ql_kl_mask == 0, 0., A_t)
-
-        # y = (F_t @ A_t) @ (B_t @ v)  # (B, num_heads, T, head_dim)
         y = (F_t @ A_t) @ (B_t @ v)
 
-        # import pdb; pdb.set_trace()
-
         # apply residual convolution for improved training
-        # v_t = v.transpose(0, 2, 3, 1)
-        # res_conv = nn.Conv(self.num_heads,
-        #                    (self.residual_conv_kernel, 1),
-        #                    padding=(self.residual_conv_kernel // 2, 0),
-        #                    feature_group_count=self.num_heads,
-        #                    use_bias=False)(v_t)
-        # res_conv = res_conv.transpose(0, 3, 1, 2)
-        # y = y + res_conv
-
-        # y = F_t @ v
+        v_t = v.transpose(0, 2, 3, 1)
+        res_conv = nn.Conv(
+            self.num_heads,
+            (self.residual_conv_kernel, 1),
+            padding=(self.residual_conv_kernel // 2, 0),
+            feature_group_count=self.num_heads,
+            use_bias=False,
+        )(v_t)
+        res_conv = res_conv.transpose(0, 3, 1, 2)
+        y = y + res_conv
 
         # combine heads
         y = y.transpose(0, 2, 1, 3).reshape(B, T, emb_dim)
@@ -246,7 +254,6 @@ class Transformer(nn.Module):
             features=self.emb_dim,
             embedding_init=nn.initializers.normal(stddev=0.02),
         )
-        # TODO: try sinusoidal embedding initializer
         self.pos_embedding = self.param(
             'pos_embedding',
             nn.initializers.normal(stddev=1 / jnp.sqrt(self.emb_dim)),
