@@ -5,6 +5,9 @@ using a low-rank matrix that is generated using landmarks selected from the inpu
 goal was to train a GPT-style decoder-only LM using this, but enforcing causal masking
 with the landmark selection scheme (average pooling) in the paper ended up being too
 hard. To deal with this, the landmarks are learned parameters.
+
+Even with learned parameters, this didn't really work and the model learned to
+cheat rather than predict the next token given the previous tokens autoregressively.
 """
 
 import functools
