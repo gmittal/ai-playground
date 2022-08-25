@@ -44,20 +44,88 @@ Dense = functools.partial(
 )
 
 
+class CausalCrossAttention(nn.Module):
+    """Causal cross-attention."""
+
+    num_latents: int
+    num_heads: int
+    dropout_rate: float
+    deterministic: bool
+
+    @nn.compact
+    def __call__(self, x):
+        B, T, emb_dim = x.shape
+        L = self.num_latents
+
+        latent_context = x[:, -L:, :]
+        q = Dense(emb_dim)(latent_context)
+        k = Dense(emb_dim)(x)
+        v = Dense(emb_dim)(x)
+
+        head_dim = emb_dim // self.num_heads
+        q = q.reshape(B, L, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+        k = k.reshape(B, T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+        v = v.reshape(B, T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+
+        causal_mask = jnp.tril(jnp.ones((L, T)))[None, None, :, :]
+        attn = q @ k.transpose(0, 1, 3, 2) * (1.0 / jnp.sqrt(head_dim))
+        attn = jnp.where(causal_mask == 0, float('-inf'), attn)
+        attn = nn.softmax(attn, axis=-1)
+        attn = nn.Dropout(self.dropout_rate, deterministic=self.deterministic)(attn)
+
+        y = attn @ v
+        y = y.transpose(0, 2, 1, 3).reshape(B, L, emb_dim)
+        y = Dense(emb_dim)(y)
+        y = nn.Dropout(self.dropout_rate, deterministic=self.deterministic)(y)
+        return y
+
+
+class CausalSelfAttention(nn.Module):
+    """Causal self-attention."""
+
+    num_heads: int
+    dropout_rate: float
+    deterministic: bool
+
+    @nn.compact
+    def __call__(self, x):
+        B, T, emb_dim = x.shape
+
+        # compute query, key, value
+        qkv = Dense(3 * emb_dim)(x)
+        q, k, v = jnp.split(qkv, 3, axis=-1)
+        head_dim = emb_dim // self.num_heads
+        k = k.reshape(B, T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+        q = q.reshape(B, T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+        v = v.reshape(B, T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+
+        # compute self-similarity + causal masking
+        causal_mask = jnp.tril(jnp.ones((T, T)))[None, None, :, :]
+        attn = q @ k.transpose(0, 1, 3, 2) * (1.0 / jnp.sqrt(head_dim))
+        attn = jnp.where(causal_mask == 0, float('-inf'), attn)
+        attn = nn.softmax(attn, axis=-1)
+        attn = nn.Dropout(self.dropout_rate, deterministic=self.deterministic)(attn)
+
+        y = attn @ v
+        y = y.transpose(0, 2, 1, 3).reshape(B, T, emb_dim)
+        y = Dense(emb_dim)(y)
+        y = nn.Dropout(self.dropout_rate, deterministic=self.deterministic)(y)
+        return y
+
+
 class Block(nn.Module):
     emb_dim: int
     block_size: int
     n_heads: int
-    decoder_mask: jnp.ndarray
 
     residual_dropout_prob: float
     attn_dropout_prob: float
     deterministic: bool
 
-    n_blocks: int = 1  # for residual projection initialization
+    n_blocks: int = 1  # for GPT residual projection initialization
 
     def setup(self):
-        self.attention = nn.SelfAttention(
+        self.attention = CausalSelfAttention(
             num_heads=self.n_heads,
             dropout_rate=self.attn_dropout_prob,
             deterministic=self.deterministic,
@@ -82,9 +150,7 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm()
 
     def __call__(self, x):
-        B, T, _ = x.shape
-        causal_mask = nn.make_causal_mask(jnp.ones((B, T)))
-        x = x + self.attention(x, causal_mask)
+        x = x + self.attention(x)
         x = self.ln1(x)
         x = x + self.mlp(x)
         x = self.ln2(x)
@@ -110,7 +176,6 @@ class Perceiver(nn.Module):
             features=self.emb_dim,
             embedding_init=nn.initializers.normal(stddev=0.02),
         )
-        # TODO: try sinusoidal embedding initializer
         self.pos_embedding = self.param(
             'pos_embedding',
             nn.initializers.normal(stddev=1 / jnp.sqrt(self.emb_dim)),
@@ -120,14 +185,19 @@ class Perceiver(nn.Module):
             self.emb_dropout_prob, deterministic=self.deterministic
         )
 
-        decoder_mask = nn.make_causal_mask(jnp.ones((1, self.block_size)))
+        self.cross_attn = CausalCrossAttention(
+            num_latents=16,
+            num_heads=self.n_heads,
+            dropout_rate=self.attn_dropout_prob,
+            deterministic=self.deterministic,
+        )
+
         blocks = [
             Block(
                 emb_dim=self.emb_dim,
                 block_size=self.block_size,
                 n_heads=self.n_heads,
                 n_blocks=self.n_blocks,  # for residual projection initialization
-                decoder_mask=decoder_mask,
                 attn_dropout_prob=self.attn_dropout_prob,
                 residual_dropout_prob=self.block_dropout_prob,
                 deterministic=self.deterministic,
@@ -146,6 +216,10 @@ class Perceiver(nn.Module):
         emb_pos = self.pos_embedding[:, :t, :]
         x = emb_tokens + emb_pos
         x = self.dropout(x)
+        x = self.cross_attn(x)
+        import pdb
+
+        pdb.set_trace()
         x = self.transformer(x)
         x = self.ln(x)
         x = self.head(x)
@@ -313,9 +387,6 @@ def sample(state, prompt, steps, config, rng, temperature=1.0, top_k=None, top_p
             {'params': state.params},
             jax.lax.dynamic_slice(tokens, (0, window_start), (B, block_size)),
         )
-
-        # TODO: add <sos> token so we can generate without prompt
-        # to predict the i-th token we must use the logit from the prev position
         logits = logits[:, jnp.where(i < block_size, i - 1, -1), :] / temperature
         if top_k is not None:
             logits = top_k_logits(logits, top_k)
