@@ -4,3 +4,5 @@ flax==0.5.1
 optax
 ml_collections
 distrax
+wandb
+transformers  # tokenizers

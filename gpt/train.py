@@ -22,6 +22,7 @@ from flax.training import train_state
 from flax.training import checkpoints
 from ml_collections import config_flags
 from torch.utils.data import Dataset, DataLoader
+from transformers import GPT2TokenizerFast
 
 Fore = colorama.Fore
 Style = colorama.Style
@@ -154,33 +155,24 @@ class Transformer(nn.Module):
 
 class CharDataset(Dataset):
     def __init__(self, data, block_size):
-        chars = sorted(list(set(data)))
-        data_size, vocab_size = len(data), len(chars)
-        print('data has %d characters, %d unique.' % (data_size, vocab_size))
-
-        self.stoi = {ch: i for i, ch in enumerate(chars)}
-        self.itos = {i: ch for i, ch in enumerate(chars)}
+        self.bpe_tokenizer = GPT2TokenizerFast.from_pretrained('gpt2')
         self.block_size = block_size
-        self.vocab_size = vocab_size
-        self.data = data
+        self.vocab_size = self.bpe_tokenizer.vocab_size
+        self.data = np.array(self.bpe_tokenizer(data)['input_ids'], dtype=np.int32)
 
     def __len__(self):
         return len(self.data) - self.block_size
 
     def encode(self, chunk):
-        # Use int32 for now due to https://github.com/google/jax#current-gotchas
-        return np.array([self.stoi[s] for s in chunk], dtype=np.int32)
+        return np.array(self.bpe_tokenizer(chunk)['input_ids'], dtype=np.int32)
 
     def decode(self, x):
-        return ''.join([self.itos[i] for i in x])
+        return self.bpe_tokenizer.decode(x)
 
     def __getitem__(self, idx):
         # grab a chunk of (block_size + 1) characters from the data
         chunk = self.data[idx : idx + self.block_size + 1]
-
-        # encode every character to an integer
-        dix = self.encode(chunk)
-        return {'x': dix[:-1], 'y': dix[1:]}
+        return {'x': chunk[:-1], 'y': chunk[1:]}
 
 
 def numpy_collate(batch):
